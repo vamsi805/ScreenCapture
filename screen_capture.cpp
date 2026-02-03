@@ -311,10 +311,11 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
 
     // Create sink writer with sample grabber
     IMFAttributes* attrs = nullptr;
-    hr = MFCreateAttributes(&attrs, 2);
+    hr = MFCreateAttributes(&attrs, 1);
     attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-    attrs->SetUnknown(MF_SINK_WRITER_ASYNC_CALLBACK, sample_grabber_sink);
 
+    // Use the activated sample grabber sink as the writer's output sink.
+    sample_grabber_sink = media_sink;
     hr = MFCreateSinkWriterFromMediaSink(sample_grabber_sink, attrs, &video_sink_writer_);
     attrs->Release();
     sample_grabber_sink->Release();

@@ -28,6 +28,7 @@
 #pragma comment(lib, "d3d11.lib")        // Direct3D 11 library
 #pragma comment(lib, "dxgi.lib")         // DXGI library
 #pragma comment(lib, "mfplat.lib")       // Media Foundation platform library
+#pragma comment(lib, "mf.lib")           // Core Media Foundation library (MFCreateSampleGrabberSinkActivate)
 #pragma comment(lib, "mfuuid.lib")       // Media Foundation UUIDs
 #pragma comment(lib, "mfreadwrite.lib")  // Media Foundation sink writer
 #pragma comment(lib, "ole32.lib")        // COM library for object creation

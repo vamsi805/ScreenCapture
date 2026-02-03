@@ -27,6 +27,7 @@ target_link_libraries(ScreenCaptureEncoder
     d3d11          # Direct3D 11
     dxgi           # DirectX Graphics Infrastructure
     mfplat         # Media Foundation Platform
+    mf             # Core Media Foundation (MFCreateSampleGrabberSinkActivate)
     mfuuid         # Media Foundation UUIDs
     mfreadwrite    # Media Foundation Read/Write
     ole32          # COM
