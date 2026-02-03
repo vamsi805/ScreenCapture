@@ -8,6 +8,7 @@
 #include <mfapi.h>            // Media Foundation API for video encoding
 #include <mfidl.h>            // Media Foundation interfaces
 #include <mfreadwrite.h>      // Media Foundation read/write interfaces
+#include <mftransform.h>      // Media Foundation transforms (IMFTransform)
 #include <mferror.h>          // Media Foundation error codese
 #include <mmdeviceapi.h>      // Multimedia device enumeration
 #include <shlwapi.h>          // Shell lightweight utility APIs (for QISearch helper)
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <queue>
 #include <atomic>
+#include <cstdint>
 
 // Link required libraries - tells linker to include these .lib files
 #pragma comment(lib, "d3d11.lib")        // Direct3D 11 library
@@ -31,6 +33,7 @@
 #pragma comment(lib, "mf.lib")           // Core Media Foundation library (MFCreateSampleGrabberSinkActivate)
 #pragma comment(lib, "mfuuid.lib")       // Media Foundation UUIDs
 #pragma comment(lib, "mfreadwrite.lib")  // Media Foundation sink writer
+#pragma comment(lib, "wmcodecdspuuid.lib") // Color converter DMO UUIDs
 #pragma comment(lib, "ole32.lib")        // COM library for object creation
 #pragma comment(lib, "shlwapi.lib")      // Shell utilities (for QISearch)
 
@@ -97,8 +100,10 @@ private:
     ID3D11Texture2D* staging_texture_;                  // CPU-accessible staging texture
     
     // Media Foundation objects for video encoding
-    IMFSinkWriter* video_sink_writer_;                  // Writes encoded samples
-    DWORD video_stream_index_;                          // Stream index in sink writer
+    IMFTransform* color_converter_;                     // RGB32 -> NV12 converter
+    IMFTransform* h264_encoder_;                        // H.264 encoder MFT
+    std::vector<uint8_t> h264_sequence_header_;         // SPS/PPS as Annex-B
+    bool sent_sequence_header_;                         // Sent SPS/PPS yet
     
        
     // Named pipe for IPC

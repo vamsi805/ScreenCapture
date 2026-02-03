@@ -1,99 +1,113 @@
 #include "screen_capture.h"
+#include <wmcodecdsp.h>
 
-// Constructor - Initialize all pointers to nullptr for safety
-class SampleGrabberCallback : public IMFSampleGrabberSinkCallback {
-private:
-    LONG ref_count_;
-    std::queue<EncodedFrame>* frame_queue_;
-    std::mutex* queue_mutex_;
+namespace {
+void AppendStartCode(std::vector<uint8_t>& out) {
+    out.push_back(0x00);
+    out.push_back(0x00);
+    out.push_back(0x00);
+    out.push_back(0x01);
+}
 
-public:
-    SampleGrabberCallback(std::queue<EncodedFrame>* queue, std::mutex* mutex)
-        : ref_count_(1), frame_queue_(queue), queue_mutex_(mutex) {
+bool ConvertAvccToAnnexB(const uint8_t* data, size_t len, std::vector<uint8_t>& out) {
+    if (len < 7) {
+        return false;
     }
 
-    // IUnknown implementation
-    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
-        static const QITAB qit[] = {
-            QITABENT(SampleGrabberCallback, IMFSampleGrabberSinkCallback),
-            QITABENT(SampleGrabberCallback, IMFClockStateSink),
-            { 0 }
-        };
-        return QISearch(this, qit, riid, ppv);
+    size_t offset = 5;  // Skip configuration version + profile/compat/level + lengthSizeMinusOne
+    uint8_t num_sps = data[offset++] & 0x1F;
+    for (uint8_t i = 0; i < num_sps; ++i) {
+        if (offset + 2 > len) return false;
+        uint16_t sps_len = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+        if (offset + sps_len > len) return false;
+        AppendStartCode(out);
+        out.insert(out.end(), data + offset, data + offset + sps_len);
+        offset += sps_len;
     }
 
-    STDMETHODIMP_(ULONG) AddRef() {
-        return InterlockedIncrement(&ref_count_);
+    if (offset + 1 > len) return false;
+    uint8_t num_pps = data[offset++];
+    for (uint8_t i = 0; i < num_pps; ++i) {
+        if (offset + 2 > len) return false;
+        uint16_t pps_len = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+        if (offset + pps_len > len) return false;
+        AppendStartCode(out);
+        out.insert(out.end(), data + offset, data + offset + pps_len);
+        offset += pps_len;
     }
 
-    STDMETHODIMP_(ULONG) Release() {
-        ULONG count = InterlockedDecrement(&ref_count_);
-        if (count == 0) delete this;
-        return count;
+    return !out.empty();
+}
+
+bool ConvertLengthPrefixedToAnnexB(const uint8_t* data, size_t len, std::vector<uint8_t>& out) {
+    size_t offset = 0;
+    while (offset + 4 <= len) {
+        uint32_t nal_len = (static_cast<uint32_t>(data[offset]) << 24) |
+                           (static_cast<uint32_t>(data[offset + 1]) << 16) |
+                           (static_cast<uint32_t>(data[offset + 2]) << 8) |
+                           static_cast<uint32_t>(data[offset + 3]);
+        offset += 4;
+        if (offset + nal_len > len) break;
+        AppendStartCode(out);
+        out.insert(out.end(), data + offset, data + offset + nal_len);
+        offset += nal_len;
     }
+    return !out.empty();
+}
 
-    // IMFClockStateSink implementation (required but not used)
-    STDMETHODIMP OnClockStart(MFTIME, LONGLONG) { return S_OK; }
-    STDMETHODIMP OnClockStop(MFTIME) { return S_OK; }
-    STDMETHODIMP OnClockPause(MFTIME) { return S_OK; }
-    STDMETHODIMP OnClockRestart(MFTIME) { return S_OK; }
-    STDMETHODIMP OnClockSetRate(MFTIME, float) { return S_OK; }
-
-    // IMFSampleGrabberSinkCallback - THIS IS WHERE WE GET ENCODED DATA!
-    STDMETHODIMP OnProcessSample(
-        REFGUID guidMajorMediaType,
-        DWORD dwSampleFlags,
-        LONGLONG llSampleTime,
-        LONGLONG llSampleDuration,
-        const BYTE* pSampleBuffer,
-        DWORD dwSampleSize)
-    {
-        // This is called by Media Foundation when an encoded frame is ready!
-
-        if (dwSampleSize == 0 || pSampleBuffer == nullptr) {
-            return S_OK;  // Empty sample, skip
-        }
-
-        // Create encoded frame structure
-        EncodedFrame frame;
-        frame.data.resize(dwSampleSize);
-        memcpy(frame.data.data(), pSampleBuffer, dwSampleSize);
-        frame.timestamp = llSampleTime / 10;  // Convert 100ns to microseconds
-
-        // Check if this is a keyframe (I-frame)
-        // In H.264, keyframes start with NAL unit type 5 (IDR)
-        // NAL header is in first byte: (pSampleBuffer[0] & 0x1F)
-        if (dwSampleSize > 4) {
-            // Check for NAL start code (00 00 00 01) followed by IDR (0x65)
-            if (pSampleBuffer[0] == 0x00 && pSampleBuffer[1] == 0x00 &&
-                pSampleBuffer[2] == 0x00 && pSampleBuffer[3] == 0x01) {
-                uint8_t nal_type = pSampleBuffer[4] & 0x1F;
-                frame.is_keyframe = (nal_type == 5);  // NAL type 5 = IDR (keyframe)
+bool ContainsKeyframe(const std::vector<uint8_t>& data) {
+    for (size_t i = 0; i + 4 < data.size(); ++i) {
+        if (data[i] == 0x00 && data[i + 1] == 0x00 &&
+            ((data[i + 2] == 0x00 && data[i + 3] == 0x01) ||
+             (data[i + 2] == 0x01))) {
+            size_t nal_index = (data[i + 2] == 0x01) ? (i + 3) : (i + 4);
+            if (nal_index < data.size()) {
+                uint8_t nal_type = data[nal_index] & 0x1F;
+                if (nal_type == 5) {
+                    return true;
+                }
             }
         }
+    }
+    return false;
+}
 
-        frame.is_audio = false;
+HRESULT CreateH264Encoder(IMFTransform** out_encoder) {
+    if (!out_encoder) return E_POINTER;
+    *out_encoder = nullptr;
 
-        // Add to queue (thread-safe)
-        {
-            std::lock_guard<std::mutex> lock(*queue_mutex_);
-            frame_queue_->push(frame);
-        }
+    HRESULT hr = CoCreateInstance(CLSID_CMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(out_encoder));
+    if (SUCCEEDED(hr)) return hr;
 
-        return S_OK;
+    IMFActivate** activates = nullptr;
+    UINT32 count = 0;
+    MFT_REGISTER_TYPE_INFO out_type = { MFMediaType_Video, MFVideoFormat_H264 };
+    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                   nullptr, &out_type, &activates, &count);
+    if (SUCCEEDED(hr) && count > 0) {
+        hr = activates[0]->ActivateObject(IID_PPV_ARGS(out_encoder));
     }
 
-    STDMETHODIMP OnSetPresentationClock(IMFPresentationClock*) { return S_OK; }
-    STDMETHODIMP OnShutdown() { return S_OK; }
-};
+    for (UINT32 i = 0; i < count; ++i) {
+        activates[i]->Release();
+    }
+    CoTaskMemFree(activates);
+    return hr;
+}
+}  // namespace
 
 ScreenCaptureEncoder::ScreenCaptureEncoder()
     : d3d_device_(nullptr)              // NULL until InitializeD3D11() succeeds
     , d3d_context_(nullptr)
     , desktop_duplication_(nullptr)
     , staging_texture_(nullptr)
-    , video_sink_writer_(nullptr)
-    , video_stream_index_(0)
+    , color_converter_(nullptr)
+    , h264_encoder_(nullptr)
+    , sent_sequence_header_(false)
     , pipe_handle_(INVALID_HANDLE_VALUE)  // Invalid handle value from Windows
     , width_(1920)                         // Default 1080p width
     , height_(1080)                        // Default 1080p height
@@ -280,102 +294,112 @@ bool ScreenCaptureEncoder::InitializeDuplication() {
 bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     HRESULT hr;
 
-    // Create sample grabber callback (this will receive encoded frames)
-    SampleGrabberCallback* callback = new SampleGrabberCallback(&frame_queue_, &queue_mutex_);
-    IMFActivate* sample_grabber_activate = nullptr;
+    // Create color converter (RGB32 -> NV12)
+    hr = CoCreateInstance(CLSID_CColorConvertDMO, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(&color_converter_));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create color converter: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
 
-    // Create sample grabber sink
-    IMFMediaSink* sample_grabber_sink = nullptr;
-    IMFMediaType* output_type = nullptr;
-
-    // Create output media type (H.264)
-    hr = MFCreateMediaType(&output_type);
+    IMFMediaType* rgb_type = nullptr;
+    hr = MFCreateMediaType(&rgb_type);
     if (FAILED(hr)) return false;
+    rgb_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    rgb_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+    rgb_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    MFSetAttributeSize(rgb_type, MF_MT_FRAME_SIZE, width_, height_);
+    MFSetAttributeRatio(rgb_type, MF_MT_FRAME_RATE, fps_, 1);
+    MFSetAttributeRatio(rgb_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
-    output_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    output_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-
-    hr = MFCreateSampleGrabberSinkActivate(output_type, callback, &sample_grabber_activate);
-    output_type->Release();
-    callback->Release();  // Activate takes ownership
-
+    hr = color_converter_->SetInputType(0, rgb_type, 0);
+    rgb_type->Release();
     if (FAILED(hr)) {
-        std::cerr << "Failed to create sample grabber: 0x" << std::hex << hr << std::endl;
+        std::cerr << "Failed to set color converter input type: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
-    // Activate to get the actual media sink
-    IMFMediaSink* media_sink = nullptr;
-    hr = sample_grabber_activate->ActivateObject(IID_PPV_ARGS(&media_sink));
-    sample_grabber_activate->Release();
-
-    // Create sink writer with sample grabber
-    IMFAttributes* attrs = nullptr;
-    hr = MFCreateAttributes(&attrs, 1);
-    attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-
-    // Use the activated sample grabber sink as the writer's output sink.
-    sample_grabber_sink = media_sink;
-    hr = MFCreateSinkWriterFromMediaSink(sample_grabber_sink, attrs, &video_sink_writer_);
-    attrs->Release();
-    sample_grabber_sink->Release();
-
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create sink writer: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-
-    // Configure output format (H.264)
-    hr = MFCreateMediaType(&output_type);
+    IMFMediaType* nv12_type = nullptr;
+    hr = MFCreateMediaType(&nv12_type);
     if (FAILED(hr)) return false;
+    nv12_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    nv12_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    nv12_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    MFSetAttributeSize(nv12_type, MF_MT_FRAME_SIZE, width_, height_);
+    MFSetAttributeRatio(nv12_type, MF_MT_FRAME_RATE, fps_, 1);
+    MFSetAttributeRatio(nv12_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
-    output_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    output_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-    output_type->SetUINT32(MF_MT_AVG_BITRATE, 5000000);
-    output_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeSize(output_type, MF_MT_FRAME_SIZE, width_, height_);
-    MFSetAttributeRatio(output_type, MF_MT_FRAME_RATE, fps_, 1);
-    MFSetAttributeRatio(output_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-    // Configure input format (RGB32)
-    IMFMediaType* input_type = nullptr;
-    hr = MFCreateMediaType(&input_type);
+    hr = color_converter_->SetOutputType(0, nv12_type, 0);
+    nv12_type->Release();
     if (FAILED(hr)) {
-        output_type->Release();
+        std::cerr << "Failed to set color converter output type: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
-    input_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    input_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-    input_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeSize(input_type, MF_MT_FRAME_SIZE, width_, height_);
-    MFSetAttributeRatio(input_type, MF_MT_FRAME_RATE, fps_, 1);
-    MFSetAttributeRatio(input_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-    hr = video_sink_writer_->AddStream(output_type, &video_stream_index_);
-    output_type->Release();
-
-    if (FAILED(hr)) {
-        input_type->Release();
-        std::cerr << "Failed to add stream: 0x" << std::hex << hr << std::endl;
+    // Create H.264 encoder MFT
+    hr = CreateH264Encoder(&h264_encoder_);
+    if (FAILED(hr) || !h264_encoder_) {
+        std::cerr << "Failed to create H.264 encoder: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
-    hr = video_sink_writer_->SetInputMediaType(video_stream_index_, input_type, nullptr);
-    input_type->Release();
+    IMFMediaType* enc_in = nullptr;
+    hr = MFCreateMediaType(&enc_in);
+    if (FAILED(hr)) return false;
+    enc_in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    enc_in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    enc_in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    MFSetAttributeSize(enc_in, MF_MT_FRAME_SIZE, width_, height_);
+    MFSetAttributeRatio(enc_in, MF_MT_FRAME_RATE, fps_, 1);
+    MFSetAttributeRatio(enc_in, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
+    hr = h264_encoder_->SetInputType(0, enc_in, 0);
+    enc_in->Release();
     if (FAILED(hr)) {
-        std::cerr << "Failed to set input media type: 0x" << std::hex << hr << std::endl;
+        std::cerr << "Failed to set H.264 encoder input type: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
-    hr = video_sink_writer_->BeginWriting();
+    IMFMediaType* enc_out = nullptr;
+    hr = MFCreateMediaType(&enc_out);
+    if (FAILED(hr)) return false;
+    enc_out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    enc_out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    enc_out->SetUINT32(MF_MT_AVG_BITRATE, 5000000);
+    enc_out->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    MFSetAttributeSize(enc_out, MF_MT_FRAME_SIZE, width_, height_);
+    MFSetAttributeRatio(enc_out, MF_MT_FRAME_RATE, fps_, 1);
+    MFSetAttributeRatio(enc_out, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+
+    hr = h264_encoder_->SetOutputType(0, enc_out, 0);
+    enc_out->Release();
     if (FAILED(hr)) {
-        std::cerr << "Failed to begin writing: 0x" << std::hex << hr << std::endl;
+        std::cerr << "Failed to set H.264 encoder output type: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
-    std::cout << "Video encoder initialized successfully (with callback)" << std::endl;
+    IMFMediaType* current_out = nullptr;
+    hr = h264_encoder_->GetOutputCurrentType(0, &current_out);
+    if (SUCCEEDED(hr) && current_out) {
+        UINT32 blob_size = 0;
+        if (SUCCEEDED(current_out->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &blob_size)) && blob_size > 0) {
+            std::vector<uint8_t> avcc(blob_size);
+            if (SUCCEEDED(current_out->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, avcc.data(), blob_size, nullptr))) {
+                h264_sequence_header_.clear();
+                ConvertAvccToAnnexB(avcc.data(), avcc.size(), h264_sequence_header_);
+            }
+        }
+        current_out->Release();
+    }
+
+    color_converter_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    color_converter_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    h264_encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    h264_encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+    sent_sequence_header_ = false;
+
+    std::cout << "Video encoder initialized successfully (raw H.264 Annex-B)" << std::endl;
     return true;
 }
 
@@ -456,10 +480,16 @@ void ScreenCaptureEncoder::Stop() {
     }
     
     // Cleanup COM objects
-    if (video_sink_writer_) {
-        video_sink_writer_->Finalize();  // Flush remaining samples
-        video_sink_writer_->Release();
-        video_sink_writer_ = nullptr;
+    if (h264_encoder_) {
+        h264_encoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        h264_encoder_->Release();
+        h264_encoder_ = nullptr;
+    }
+
+    if (color_converter_) {
+        color_converter_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        color_converter_->Release();
+        color_converter_ = nullptr;
     }
     
     
@@ -614,9 +644,9 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
     
-    // Create Media Foundation sample
-    IMFSample* sample = nullptr;
-    hr = MFCreateSample(&sample);
+    // Create Media Foundation sample (RGB32)
+    IMFSample* rgb_sample = nullptr;
+    hr = MFCreateSample(&rgb_sample);
     if (FAILED(hr)) {
         d3d_context_->Unmap(staging_texture_, 0);
         return false;
@@ -628,7 +658,7 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
     
     hr = MFCreateMemoryBuffer(buffer_size, &buffer);
     if (FAILED(hr)) {
-        sample->Release();
+        rgb_sample->Release();
         d3d_context_->Unmap(staging_texture_, 0);
         return false;
     }
@@ -651,38 +681,178 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
     
     // Unmap staging texture
     d3d_context_->Unmap(staging_texture_, 0);
-    
+
     // Add buffer to sample
-    sample->AddBuffer(buffer);
+    rgb_sample->AddBuffer(buffer);
     buffer->Release();
-    
+
     // Set sample timestamp (in 100ns units)
-    sample->SetSampleTime(timestamp * 10);  // Convert microseconds to 100ns
-    
+    rgb_sample->SetSampleTime(timestamp * 10);  // Convert microseconds to 100ns
+
     // Set sample duration
-    sample->SetSampleDuration(frame_duration_);
-    
-    // Write sample to encoder
-    hr = video_sink_writer_->WriteSample(video_stream_index_, sample);
-    sample->Release();
-    
+    rgb_sample->SetSampleDuration(frame_duration_);
+
+    // Convert RGB32 -> NV12
+    hr = color_converter_->ProcessInput(0, rgb_sample, 0);
+    rgb_sample->Release();
     if (FAILED(hr)) {
-        std::cerr << "Failed to write video sample: 0x" << std::hex << hr << std::endl;
+        std::cerr << "Color converter ProcessInput failed: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    
-    // Note: Encoded data is not immediately available
-    // Media Foundation buffers internally and outputs compressed frames
-    // To get encoded data, you need to use IMFSinkWriterCallback or read from the byte stream
-    
+
+    MFT_OUTPUT_STREAM_INFO cc_info = {};
+    hr = color_converter_->GetOutputStreamInfo(0, &cc_info);
+    if (FAILED(hr)) {
+        std::cerr << "Color converter GetOutputStreamInfo failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    DWORD nv12_buffer_size = 0;
+    if (FAILED(MFCalculateImageSize(MFVideoFormat_NV12, width_, height_, &nv12_buffer_size))) {
+        nv12_buffer_size = width_ * height_ * 3 / 2;
+    }
+    DWORD cc_cb = cc_info.cbSize > 0 ? cc_info.cbSize : nv12_buffer_size;
+
+    IMFSample* nv12_sample = nullptr;
+    hr = MFCreateSample(&nv12_sample);
+    if (FAILED(hr)) return false;
+
+    IMFMediaBuffer* nv12_buffer = nullptr;
+    hr = MFCreateMemoryBuffer(cc_cb, &nv12_buffer);
+    if (FAILED(hr)) {
+        nv12_sample->Release();
+        return false;
+    }
+    nv12_sample->AddBuffer(nv12_buffer);
+    nv12_buffer->Release();
+    nv12_sample->SetSampleTime(timestamp * 10);
+    nv12_sample->SetSampleDuration(frame_duration_);
+
+    MFT_OUTPUT_DATA_BUFFER cc_out = {};
+    cc_out.dwStreamID = 0;
+    cc_out.pSample = nv12_sample;
+    DWORD cc_status = 0;
+    hr = color_converter_->ProcessOutput(0, 1, &cc_out, &cc_status);
+    if (cc_out.pEvents) {
+        cc_out.pEvents->Release();
+    }
+    if (FAILED(hr)) {
+        nv12_sample->Release();
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            return true;
+        }
+        std::cerr << "Color converter ProcessOutput failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    // Feed NV12 to H.264 encoder
+    hr = h264_encoder_->ProcessInput(0, nv12_sample, 0);
+    nv12_sample->Release();
+    if (FAILED(hr)) {
+        std::cerr << "H.264 encoder ProcessInput failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    MFT_OUTPUT_STREAM_INFO enc_info = {};
+    hr = h264_encoder_->GetOutputStreamInfo(0, &enc_info);
+    if (FAILED(hr)) {
+        std::cerr << "H.264 encoder GetOutputStreamInfo failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    while (true) {
+        IMFSample* enc_sample = nullptr;
+        if ((enc_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
+            DWORD enc_cb = enc_info.cbSize > 0 ? enc_info.cbSize : (width_ * height_ * 4);
+            IMFMediaBuffer* enc_buffer = nullptr;
+            if (FAILED(MFCreateSample(&enc_sample))) return false;
+            if (FAILED(MFCreateMemoryBuffer(enc_cb, &enc_buffer))) {
+                enc_sample->Release();
+                return false;
+            }
+            enc_sample->AddBuffer(enc_buffer);
+            enc_buffer->Release();
+        }
+
+        MFT_OUTPUT_DATA_BUFFER enc_out = {};
+        enc_out.dwStreamID = 0;
+        enc_out.pSample = enc_sample;
+        DWORD enc_status = 0;
+        hr = h264_encoder_->ProcessOutput(0, 1, &enc_out, &enc_status);
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            if (enc_out.pEvents) enc_out.pEvents->Release();
+            if (enc_sample) enc_sample->Release();
+            break;
+        }
+        if (FAILED(hr)) {
+            if (enc_out.pEvents) enc_out.pEvents->Release();
+            if (enc_sample) enc_sample->Release();
+            std::cerr << "H.264 encoder ProcessOutput failed: 0x" << std::hex << hr << std::endl;
+            return false;
+        }
+
+        IMFSample* out_sample = enc_out.pSample;
+        IMFMediaBuffer* out_buffer = nullptr;
+        if (SUCCEEDED(out_sample->ConvertToContiguousBuffer(&out_buffer))) {
+            BYTE* out_data = nullptr;
+            DWORD out_max = 0;
+            DWORD out_len = 0;
+            if (SUCCEEDED(out_buffer->Lock(&out_data, &out_max, &out_len))) {
+                if (out_len > 0) {
+                    std::vector<uint8_t> annexb;
+                    if (out_len >= 4 &&
+                        out_data[0] == 0x00 && out_data[1] == 0x00 &&
+                        (out_data[2] == 0x01 || (out_data[2] == 0x00 && out_data[3] == 0x01))) {
+                        annexb.assign(out_data, out_data + out_len);
+                    } else if (!ConvertLengthPrefixedToAnnexB(out_data, out_len, annexb)) {
+                        annexb.assign(out_data, out_data + out_len);
+                    }
+
+                    if (!sent_sequence_header_ && !h264_sequence_header_.empty()) {
+                        EncodedFrame header_frame;
+                        header_frame.data = h264_sequence_header_;
+                        header_frame.timestamp = timestamp;
+                        header_frame.is_keyframe = false;
+                        header_frame.is_audio = false;
+                        {
+                            std::lock_guard<std::mutex> lock(queue_mutex_);
+                            frame_queue_.push(std::move(header_frame));
+                        }
+                        sent_sequence_header_ = true;
+                    }
+
+                    EncodedFrame frame;
+                    frame.data = std::move(annexb);
+                    frame.timestamp = timestamp;
+                    frame.is_keyframe = ContainsKeyframe(frame.data);
+                    frame.is_audio = false;
+                    {
+                        std::lock_guard<std::mutex> lock(queue_mutex_);
+                        frame_queue_.push(std::move(frame));
+                    }
+                }
+                out_buffer->Unlock();
+            }
+            out_buffer->Release();
+        }
+
+        if (enc_out.pEvents) enc_out.pEvents->Release();
+        if (out_sample) out_sample->Release();
+    }
+
     return true;
 }
 
 bool ScreenCaptureEncoder::SendFrameToPipe(const EncodedFrame& frame) {
-    // Protocol: [4 bytes: size] [size bytes: data]
-    // This allows the Go process to know how much data to read
+    // Protocol (little-endian):
+    // [4 bytes: size] [8 bytes: timestamp_us] [1 byte: flags] [size bytes: data]
+    // flags bit0 = keyframe, bit1 = audio
     
     uint32_t size = static_cast<uint32_t>(frame.data.size());
+    uint64_t timestamp_us = frame.timestamp;
+    uint8_t flags = 0;
+    if (frame.is_keyframe) flags |= 0x01;
+    if (frame.is_audio) flags |= 0x02;
     DWORD bytes_written = 0;
     
     // Write size
@@ -696,6 +866,34 @@ bool ScreenCaptureEncoder::SendFrameToPipe(const EncodedFrame& frame) {
     
     if (!success || bytes_written != sizeof(size)) {
         std::cerr << "Failed to write frame size to pipe" << std::endl;
+        return false;
+    }
+
+    // Write timestamp (microseconds)
+    success = WriteFile(
+        pipe_handle_,
+        &timestamp_us,
+        sizeof(timestamp_us),
+        &bytes_written,
+        nullptr
+    );
+
+    if (!success || bytes_written != sizeof(timestamp_us)) {
+        std::cerr << "Failed to write frame timestamp to pipe" << std::endl;
+        return false;
+    }
+
+    // Write flags
+    success = WriteFile(
+        pipe_handle_,
+        &flags,
+        sizeof(flags),
+        &bytes_written,
+        nullptr
+    );
+
+    if (!success || bytes_written != sizeof(flags)) {
+        std::cerr << "Failed to write frame flags to pipe" << std::endl;
         return false;
     }
     
