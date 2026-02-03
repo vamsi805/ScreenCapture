@@ -1,6 +1,92 @@
 #include "screen_capture.h"
 
 // Constructor - Initialize all pointers to nullptr for safety
+class SampleGrabberCallback : public IMFSampleGrabberSinkCallback {
+private:
+    LONG ref_count_;
+    std::queue<EncodedFrame>* frame_queue_;
+    std::mutex* queue_mutex_;
+
+public:
+    SampleGrabberCallback(std::queue<EncodedFrame>* queue, std::mutex* mutex)
+        : ref_count_(1), frame_queue_(queue), queue_mutex_(mutex) {
+    }
+
+    // IUnknown implementation
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
+        static const QITAB qit[] = {
+            QITABENT(SampleGrabberCallback, IMFSampleGrabberSinkCallback),
+            QITABENT(SampleGrabberCallback, IMFClockStateSink),
+            { 0 }
+        };
+        return QISearch(this, qit, riid, ppv);
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() {
+        return InterlockedIncrement(&ref_count_);
+    }
+
+    STDMETHODIMP_(ULONG) Release() {
+        ULONG count = InterlockedDecrement(&ref_count_);
+        if (count == 0) delete this;
+        return count;
+    }
+
+    // IMFClockStateSink implementation (required but not used)
+    STDMETHODIMP OnClockStart(MFTIME, LONGLONG) { return S_OK; }
+    STDMETHODIMP OnClockStop(MFTIME) { return S_OK; }
+    STDMETHODIMP OnClockPause(MFTIME) { return S_OK; }
+    STDMETHODIMP OnClockRestart(MFTIME) { return S_OK; }
+    STDMETHODIMP OnClockSetRate(MFTIME, float) { return S_OK; }
+
+    // IMFSampleGrabberSinkCallback - THIS IS WHERE WE GET ENCODED DATA!
+    STDMETHODIMP OnProcessSample(
+        REFGUID guidMajorMediaType,
+        DWORD dwSampleFlags,
+        LONGLONG llSampleTime,
+        LONGLONG llSampleDuration,
+        const BYTE* pSampleBuffer,
+        DWORD dwSampleSize)
+    {
+        // This is called by Media Foundation when an encoded frame is ready!
+
+        if (dwSampleSize == 0 || pSampleBuffer == nullptr) {
+            return S_OK;  // Empty sample, skip
+        }
+
+        // Create encoded frame structure
+        EncodedFrame frame;
+        frame.data.resize(dwSampleSize);
+        memcpy(frame.data.data(), pSampleBuffer, dwSampleSize);
+        frame.timestamp = llSampleTime / 10;  // Convert 100ns to microseconds
+
+        // Check if this is a keyframe (I-frame)
+        // In H.264, keyframes start with NAL unit type 5 (IDR)
+        // NAL header is in first byte: (pSampleBuffer[0] & 0x1F)
+        if (dwSampleSize > 4) {
+            // Check for NAL start code (00 00 00 01) followed by IDR (0x65)
+            if (pSampleBuffer[0] == 0x00 && pSampleBuffer[1] == 0x00 &&
+                pSampleBuffer[2] == 0x00 && pSampleBuffer[3] == 0x01) {
+                uint8_t nal_type = pSampleBuffer[4] & 0x1F;
+                frame.is_keyframe = (nal_type == 5);  // NAL type 5 = IDR (keyframe)
+            }
+        }
+
+        frame.is_audio = false;
+
+        // Add to queue (thread-safe)
+        {
+            std::lock_guard<std::mutex> lock(*queue_mutex_);
+            frame_queue_->push(frame);
+        }
+
+        return S_OK;
+    }
+
+    STDMETHODIMP OnSetPresentationClock(IMFPresentationClock*) { return S_OK; }
+    STDMETHODIMP OnShutdown() { return S_OK; }
+};
+
 ScreenCaptureEncoder::ScreenCaptureEncoder()
     : d3d_device_(nullptr)              // NULL until InitializeD3D11() succeeds
     , d3d_context_(nullptr)
@@ -193,165 +279,102 @@ bool ScreenCaptureEncoder::InitializeDuplication() {
 // Initialize H.264 video encoder using Media Foundation
 bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     HRESULT hr;
-    
-    // Create a temporary file stream for the sink writer
-    // In production, you might write to memory or a callback
-    IMFByteStream* byte_stream = nullptr;
-    hr = MFCreateTempFile(
-        MF_ACCESSMODE_READWRITE,  // Read/write access
-        MF_OPENMODE_DELETE_IF_EXIST,  // Delete if exists
-        MF_FILEFLAGS_NONE,        // No special flags
-        &byte_stream              // OUT: byte stream
-    );
-    
+
+    // Create sample grabber callback (this will receive encoded frames)
+    SampleGrabberCallback* callback = new SampleGrabberCallback(&frame_queue_, &queue_mutex_);
+    IMFActivate* sample_grabber_activate = nullptr;
+
+    // Create sample grabber sink
+    IMFMediaSink* sample_grabber_sink = nullptr;
+    IMFMediaType* output_type = nullptr;
+
+    // Create output media type (H.264)
+    hr = MFCreateMediaType(&output_type);
+    if (FAILED(hr)) return false;
+
+    output_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    output_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+
+    hr = MFCreateSampleGrabberSinkActivate(output_type, callback, &sample_grabber_activate);
+    output_type->Release();
+    callback->Release();  // Activate takes ownership
+
     if (FAILED(hr)) {
-        std::cerr << "Failed to create temp file: 0x" << std::hex << hr << std::endl;
+        std::cerr << "Failed to create sample grabber: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    
-    // Create sink writer attributes
-    IMFAttributes* sink_attrs = nullptr;
-    hr = MFCreateAttributes(&sink_attrs, 1);  // 1 = initial attribute capacity
-    if (FAILED(hr)) {
-        byte_stream->Release();
-        return false;
-    }
-    
-    // Enable hardware acceleration (QuickSync, NVENC, AMF)
-    // This tells Media Foundation to prefer GPU encoders over CPU
-    sink_attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-    
-    // Create the sink writer
-    // Sink writer manages encoding and writing samples
-    hr = MFCreateSinkWriterFromURL(
-        nullptr,           // No URL (using byte stream instead)
-        byte_stream,       // Output byte stream
-        sink_attrs,        // Attributes
-        &video_sink_writer_  // OUT: sink writer
-    );
-    
-    sink_attrs->Release();  // Release attributes
-    byte_stream->Release(); // Release byte stream
-    
+
+    // Activate to get the actual media sink
+    IMFMediaSink* media_sink = nullptr;
+    hr = sample_grabber_activate->ActivateObject(IID_PPV_ARGS(&media_sink));
+    sample_grabber_activate->Release();
+
+    // Create sink writer with sample grabber
+    IMFAttributes* attrs = nullptr;
+    hr = MFCreateAttributes(&attrs, 2);
+    attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+    attrs->SetUnknown(MF_SINK_WRITER_ASYNC_CALLBACK, sample_grabber_sink);
+
+    hr = MFCreateSinkWriterFromMediaSink(sample_grabber_sink, attrs, &video_sink_writer_);
+    attrs->Release();
+    sample_grabber_sink->Release();
+
     if (FAILED(hr)) {
         std::cerr << "Failed to create sink writer: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    
-    // Configure output media type (H.264)
-    IMFMediaType* output_type = nullptr;
-    hr = MFCreateMediaType(&output_type);  // Create blank media type
-    if (FAILED(hr)) {
-        return false;
-    }
-    
-    // Set major type to VIDEO
+
+    // Configure output format (H.264)
+    hr = MFCreateMediaType(&output_type);
+    if (FAILED(hr)) return false;
+
     output_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    
-    // Set subtype to H.264
-    // MFVideoFormat_H264 = H.264 compressed video
     output_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-    
-    // Set average bitrate (in bits per second)
-    // 5 Mbps for 1080p60 is reasonable for cloud gaming
     output_type->SetUINT32(MF_MT_AVG_BITRATE, 5000000);
-    
-    // Set interlace mode to progressive (not interlaced)
     output_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    
-    // Set frame size (width and height packed into 64-bit value)
-    // High 32 bits = width, low 32 bits = height
-    hr = MFSetAttributeSize(output_type, MF_MT_FRAME_SIZE, width_, height_);
-    if (FAILED(hr)) {
-        output_type->Release();
-        return false;
-    }
-    
-    // Set frame rate (numerator and denominator)
-    // fps_ fps = fps_/1
-    hr = MFSetAttributeRatio(output_type, MF_MT_FRAME_RATE, fps_, 1);
-    if (FAILED(hr)) {
-        output_type->Release();
-        return false;
-    }
-    
-    // Set pixel aspect ratio (1:1 for square pixels)
-    hr = MFSetAttributeRatio(output_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-    if (FAILED(hr)) {
-        output_type->Release();
-        return false;
-    }
-    
-    // Configure input media type (uncompressed BGRA)
+    MFSetAttributeSize(output_type, MF_MT_FRAME_SIZE, width_, height_);
+    MFSetAttributeRatio(output_type, MF_MT_FRAME_RATE, fps_, 1);
+    MFSetAttributeRatio(output_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+
+    // Configure input format (RGB32)
     IMFMediaType* input_type = nullptr;
     hr = MFCreateMediaType(&input_type);
     if (FAILED(hr)) {
         output_type->Release();
         return false;
     }
-    
-    // Set major type to VIDEO
+
     input_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    
-    // Set subtype to RGB32 (BGRA format from desktop duplication)
     input_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-    
-    // Set interlace mode
     input_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    
-    // Set frame size
-    hr = MFSetAttributeSize(input_type, MF_MT_FRAME_SIZE, width_, height_);
-    if (FAILED(hr)) {
-        input_type->Release();
-        output_type->Release();
-        return false;
-    }
-    
-    // Set frame rate
-    hr = MFSetAttributeRatio(input_type, MF_MT_FRAME_RATE, fps_, 1);
-    if (FAILED(hr)) {
-        input_type->Release();
-        output_type->Release();
-        return false;
-    }
-    
-    // Set pixel aspect ratio
-    hr = MFSetAttributeRatio(input_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-    if (FAILED(hr)) {
-        input_type->Release();
-        output_type->Release();
-        return false;
-    }
-    
-    // Add stream to sink writer
-    // This creates a new stream and returns its index
+    MFSetAttributeSize(input_type, MF_MT_FRAME_SIZE, width_, height_);
+    MFSetAttributeRatio(input_type, MF_MT_FRAME_RATE, fps_, 1);
+    MFSetAttributeRatio(input_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+
     hr = video_sink_writer_->AddStream(output_type, &video_stream_index_);
-    output_type->Release();  // No longer needed
-    
+    output_type->Release();
+
     if (FAILED(hr)) {
         input_type->Release();
         std::cerr << "Failed to add stream: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    
-    // Set input media type on the stream
-    // This tells the encoder what format to expect
+
     hr = video_sink_writer_->SetInputMediaType(video_stream_index_, input_type, nullptr);
-    input_type->Release();  // No longer needed
-    
+    input_type->Release();
+
     if (FAILED(hr)) {
         std::cerr << "Failed to set input media type: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    
-    // Begin writing - must be called before WriteSample
+
     hr = video_sink_writer_->BeginWriting();
     if (FAILED(hr)) {
         std::cerr << "Failed to begin writing: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    
-    std::cout << "Video encoder initialized successfully" << std::endl;
+
+    std::cout << "Video encoder initialized successfully (with callback)" << std::endl;
     return true;
 }
 

@@ -10,6 +10,8 @@
 #include <mfreadwrite.h>      // Media Foundation read/write interfaces
 #include <mferror.h>          // Media Foundation error codese
 #include <mmdeviceapi.h>      // Multimedia device enumeration
+#include <shlwapi.h>          // Shell lightweight utility APIs (for QISearch helper)
+
 
 // Standard library
 #include <iostream>
@@ -29,6 +31,8 @@
 #pragma comment(lib, "mfuuid.lib")       // Media Foundation UUIDs
 #pragma comment(lib, "mfreadwrite.lib")  // Media Foundation sink writer
 #pragma comment(lib, "ole32.lib")        // COM library for object creation
+#pragma comment(lib, "shlwapi.lib")      // Shell utilities (for QISearch)
+
 
 // Structure to hold a single encoded frame with timestamp
 struct EncodedFrame {

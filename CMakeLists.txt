@@ -30,6 +30,7 @@ target_link_libraries(ScreenCaptureEncoder
     mfuuid         # Media Foundation UUIDs
     mfreadwrite    # Media Foundation Read/Write
     ole32          # COM
+    shlwapi      
     strmiids       # Additional Media Foundation IDs
 )
 
