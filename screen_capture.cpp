@@ -135,31 +135,39 @@ bool SetH264OutputType(IMFTransform* encoder, UINT32 width, UINT32 height, UINT3
 bool SetH264InputType(IMFTransform* encoder, UINT32 width, UINT32 height, UINT32 fps) {
     if (!encoder) return false;
 
-    IMFMediaType* type = nullptr;
-    HRESULT hr = MFCreateMediaType(&type);
-    if (FAILED(hr)) return false;
+    auto try_type = [&](bool add_sample_size) -> HRESULT {
+        IMFMediaType* type = nullptr;
+        HRESULT hr = MFCreateMediaType(&type);
+        if (FAILED(hr)) return hr;
 
-    type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeSize(type, MF_MT_FRAME_SIZE, width, height);
-    MFSetAttributeRatio(type, MF_MT_FRAME_RATE, fps, 1);
-    MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-    type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
-    type->SetUINT32(MF_MT_SAMPLE_SIZE, width * height * 3 / 2);
-    type->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
+        type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+        type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        MFSetAttributeSize(type, MF_MT_FRAME_SIZE, width, height);
+        MFSetAttributeRatio(type, MF_MT_FRAME_RATE, fps, 1);
+        MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
-    hr = encoder->SetInputType(0, type, MFT_SET_TYPE_TEST_ONLY);
-    if (SUCCEEDED(hr)) {
-        hr = encoder->SetInputType(0, type, 0);
-    }
-    type->Release();
+        if (add_sample_size) {
+            type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
+            type->SetUINT32(MF_MT_SAMPLE_SIZE, width * height * 3 / 2);
+        }
 
-    if (FAILED(hr)) {
-        std::cerr << "SetInputType failed: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-    return true;
+        hr = encoder->SetInputType(0, type, MFT_SET_TYPE_TEST_ONLY);
+        if (SUCCEEDED(hr)) {
+            hr = encoder->SetInputType(0, type, 0);
+        }
+        type->Release();
+        return hr;
+    };
+
+    HRESULT hr = try_type(false);
+    if (SUCCEEDED(hr)) return true;
+
+    hr = try_type(true);
+    if (SUCCEEDED(hr)) return true;
+
+    std::cerr << "SetInputType failed: 0x" << std::hex << hr << std::endl;
+    return false;
 }
 }  // namespace
 
