@@ -33,7 +33,6 @@
 #pragma comment(lib, "mf.lib")           // Core Media Foundation library (MFCreateSampleGrabberSinkActivate)
 #pragma comment(lib, "mfuuid.lib")       // Media Foundation UUIDs
 #pragma comment(lib, "mfreadwrite.lib")  // Media Foundation sink writer
-#pragma comment(lib, "wmcodecdspuuid.lib") // Color converter DMO UUIDs
 #pragma comment(lib, "ole32.lib")        // COM library for object creation
 #pragma comment(lib, "shlwapi.lib")      // Shell utilities (for QISearch)
 
@@ -97,7 +96,8 @@ private:
     ID3D11Device* d3d_device_;                          // Direct3D 11 device object
     ID3D11DeviceContext* d3d_context_;                  // Device context for commands
     IDXGIOutputDuplication* desktop_duplication_;       // Desktop duplication interface
-    ID3D11Texture2D* staging_texture_;                  // CPU-accessible staging texture
+    IMFDXGIDeviceManager* dxgi_manager_;               // D3D11 device manager for MF MFTs
+    UINT reset_token_;                                  // Token for DXGI device manager
     
     // Media Foundation objects for video encoding
     IMFTransform* color_converter_;                     // RGB32 -> NV12 converter

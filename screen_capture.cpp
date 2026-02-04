@@ -1,5 +1,4 @@
 #include "screen_capture.h"
-#include <wmcodecdsp.h>
 
 namespace {
 void AppendStartCode(std::vector<uint8_t>& out) {
@@ -78,10 +77,6 @@ HRESULT CreateH264Encoder(IMFTransform** out_encoder) {
     if (!out_encoder) return E_POINTER;
     *out_encoder = nullptr;
 
-    HRESULT hr = CoCreateInstance(CLSID_CMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_PPV_ARGS(out_encoder));
-    if (SUCCEEDED(hr)) return hr;
-
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
     MFT_REGISTER_TYPE_INFO out_type = { MFMediaType_Video, MFVideoFormat_H264 };
@@ -96,6 +91,14 @@ HRESULT CreateH264Encoder(IMFTransform** out_encoder) {
         activates[i]->Release();
     }
     CoTaskMemFree(activates);
+
+    if (SUCCEEDED(hr) && *out_encoder) {
+        return hr;
+    }
+
+    // Fallback to software encoder if no hardware MFT is available.
+    hr = CoCreateInstance(CLSID_CMSH264EncoderMFT, nullptr, CLSCTX_INPROC_SERVER,
+                          IID_PPV_ARGS(out_encoder));
     return hr;
 }
 }  // namespace
@@ -104,7 +107,8 @@ ScreenCaptureEncoder::ScreenCaptureEncoder()
     : d3d_device_(nullptr)              // NULL until InitializeD3D11() succeeds
     , d3d_context_(nullptr)
     , desktop_duplication_(nullptr)
-    , staging_texture_(nullptr)
+    , dxgi_manager_(nullptr)
+    , reset_token_(0)
     , color_converter_(nullptr)
     , h264_encoder_(nullptr)
     , sent_sequence_header_(false)
@@ -189,11 +193,12 @@ bool ScreenCaptureEncoder::InitializeD3D11() {
     // nullptr = use default adapter (primary GPU)
     // D3D_DRIVER_TYPE_HARDWARE = use GPU hardware acceleration
     // D3D11_CREATE_DEVICE_BGRA_SUPPORT = support BGRA format (needed for desktop capture)
+    UINT device_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
     HRESULT hr = D3D11CreateDevice(
         nullptr,                           // Use default adapter (primary GPU)
         D3D_DRIVER_TYPE_HARDWARE,         // Use hardware GPU (not software emulation)
         nullptr,                           // No software rasterizer DLL
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, // Support BGRA pixel format
+        device_flags,                     // Support BGRA + video processing
         feature_levels,                    // Array of feature levels to try
         1,                                 // Number of feature levels in array
         D3D11_SDK_VERSION,                // SDK version
@@ -204,6 +209,19 @@ bool ScreenCaptureEncoder::InitializeD3D11() {
     
     if (FAILED(hr)) {
         std::cerr << "D3D11CreateDevice failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    // Create DXGI device manager for Media Foundation MFTs (hardware path).
+    hr = MFCreateDXGIDeviceManager(&reset_token_, &dxgi_manager_);
+    if (FAILED(hr)) {
+        std::cerr << "MFCreateDXGIDeviceManager failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    hr = dxgi_manager_->ResetDevice(d3d_device_, reset_token_);
+    if (FAILED(hr)) {
+        std::cerr << "DXGIDeviceManager ResetDevice failed: 0x" << std::hex << hr << std::endl;
         return false;
     }
     
@@ -265,27 +283,6 @@ bool ScreenCaptureEncoder::InitializeDuplication() {
         return false;
     }
     
-    // Create a staging texture for CPU access
-    // Desktop duplication gives us GPU textures, we need CPU-accessible staging
-    D3D11_TEXTURE2D_DESC staging_desc = {};
-    staging_desc.Width = width_;                    // Texture width
-    staging_desc.Height = height_;                  // Texture height
-    staging_desc.MipLevels = 1;                     // No mipmaps
-    staging_desc.ArraySize = 1;                     // Single texture (not array)
-    staging_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;  // 32-bit BGRA format
-    staging_desc.SampleDesc.Count = 1;              // No multisampling
-    staging_desc.SampleDesc.Quality = 0;            // No multisampling
-    staging_desc.Usage = D3D11_USAGE_STAGING;       // Staging = CPU can read
-    staging_desc.BindFlags = 0;                     // No binding (staging only)
-    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;  // CPU can read
-    staging_desc.MiscFlags = 0;                     // No misc flags
-    
-    hr = d3d_device_->CreateTexture2D(&staging_desc, nullptr, &staging_texture_);
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create staging texture: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-    
     std::cout << "Desktop duplication initialized successfully" << std::endl;
     return true;
 }
@@ -294,13 +291,21 @@ bool ScreenCaptureEncoder::InitializeDuplication() {
 bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     HRESULT hr;
 
-    // Create color converter (RGB32 -> NV12)
-    hr = CoCreateInstance(CLSID_CColorConvertDMO, nullptr, CLSCTX_INPROC_SERVER,
+    // Create GPU video processor (RGB32 -> NV12)
+    hr = CoCreateInstance(CLSID_VideoProcessorMFT, nullptr, CLSCTX_INPROC_SERVER,
                           IID_PPV_ARGS(&color_converter_));
     if (FAILED(hr)) {
-        std::cerr << "Failed to create color converter: 0x" << std::hex << hr << std::endl;
+        std::cerr << "Failed to create video processor MFT: 0x" << std::hex << hr << std::endl;
         return false;
     }
+
+    IMFAttributes* cc_attrs = nullptr;
+    if (SUCCEEDED(color_converter_->GetAttributes(&cc_attrs)) && cc_attrs) {
+        cc_attrs->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
+        cc_attrs->Release();
+    }
+    color_converter_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
+                                     reinterpret_cast<ULONG_PTR>(dxgi_manager_));
 
     IMFMediaType* rgb_type = nullptr;
     hr = MFCreateMediaType(&rgb_type);
@@ -336,12 +341,20 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
         return false;
     }
 
-    // Create H.264 encoder MFT
+    // Create H.264 encoder MFT (hardware-first)
     hr = CreateH264Encoder(&h264_encoder_);
     if (FAILED(hr) || !h264_encoder_) {
         std::cerr << "Failed to create H.264 encoder: 0x" << std::hex << hr << std::endl;
         return false;
     }
+
+    IMFAttributes* enc_attrs = nullptr;
+    if (SUCCEEDED(h264_encoder_->GetAttributes(&enc_attrs)) && enc_attrs) {
+        enc_attrs->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
+        enc_attrs->Release();
+    }
+    h264_encoder_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
+                                  reinterpret_cast<ULONG_PTR>(dxgi_manager_));
 
     IMFMediaType* enc_out = nullptr;
     hr = MFCreateMediaType(&enc_out);
@@ -494,11 +507,6 @@ void ScreenCaptureEncoder::Stop() {
     }
     
     
-    if (staging_texture_) {
-        staging_texture_->Release();
-        staging_texture_ = nullptr;
-    }
-    
     if (desktop_duplication_) {
         desktop_duplication_->ReleaseFrame();  // Release any held frame
         desktop_duplication_->Release();
@@ -513,6 +521,11 @@ void ScreenCaptureEncoder::Stop() {
     if (d3d_device_) {
         d3d_device_->Release();
         d3d_device_ = nullptr;
+    }
+
+    if (dxgi_manager_) {
+        dxgi_manager_->Release();
+        dxgi_manager_ = nullptr;
     }
     
     if (pipe_handle_ != INVALID_HANDLE_VALUE) {
@@ -627,70 +640,28 @@ bool ScreenCaptureEncoder::CaptureFrame(ID3D11Texture2D** out_texture, DXGI_OUTD
 
 // Encode captured texture to H.264
 bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t timestamp) {
-    // Copy texture to staging texture (GPU to CPU)
-    d3d_context_->CopyResource(staging_texture_, texture);
-    
-    // Map staging texture for CPU access
-    D3D11_MAPPED_SUBRESOURCE mapped_resource = {};
-    HRESULT hr = d3d_context_->Map(
-        staging_texture_,           // Resource to map
-        0,                          // Subresource index
-        D3D11_MAP_READ,            // Map for reading
-        0,                          // Flags
-        &mapped_resource            // OUT: mapped data
-    );
-    
-    if (FAILED(hr)) {
-        std::cerr << "Failed to map texture: 0x" << std::hex << hr << std::endl;
+    if (!texture) {
         return false;
     }
-    
-    // Create Media Foundation sample (RGB32)
+
+    // Wrap the GPU texture directly in an MF sample (no CPU readback).
     IMFSample* rgb_sample = nullptr;
-    hr = MFCreateSample(&rgb_sample);
+    HRESULT hr = MFCreateSample(&rgb_sample);
     if (FAILED(hr)) {
-        d3d_context_->Unmap(staging_texture_, 0);
         return false;
     }
-    
-    // Create media buffer from mapped data
-    IMFMediaBuffer* buffer = nullptr;
-    DWORD buffer_size = mapped_resource.RowPitch * height_;  // Total bytes
-    
-    hr = MFCreateMemoryBuffer(buffer_size, &buffer);
+
+    IMFMediaBuffer* rgb_buffer = nullptr;
+    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture, 0, FALSE, &rgb_buffer);
     if (FAILED(hr)) {
         rgb_sample->Release();
-        d3d_context_->Unmap(staging_texture_, 0);
+        std::cerr << "MFCreateDXGISurfaceBuffer failed: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    
-    // Lock buffer and copy data
-    BYTE* buffer_data = nullptr;
-    hr = buffer->Lock(&buffer_data, nullptr, nullptr);
-    if (SUCCEEDED(hr)) {
-        // Copy each row (may have padding)
-        for (int y = 0; y < height_; y++) {
-            memcpy(
-                buffer_data + y * width_ * 4,  // Destination (4 bytes per pixel)
-                static_cast<BYTE*>(mapped_resource.pData) + y * mapped_resource.RowPitch,  // Source
-                width_ * 4  // Bytes per row
-            );
-        }
-        buffer->Unlock();
-        buffer->SetCurrentLength(width_ * height_ * 4);  // Set actual data length
-    }
-    
-    // Unmap staging texture
-    d3d_context_->Unmap(staging_texture_, 0);
 
-    // Add buffer to sample
-    rgb_sample->AddBuffer(buffer);
-    buffer->Release();
-
-    // Set sample timestamp (in 100ns units)
-    rgb_sample->SetSampleTime(timestamp * 10);  // Convert microseconds to 100ns
-
-    // Set sample duration
+    rgb_sample->AddBuffer(rgb_buffer);
+    rgb_buffer->Release();
+    rgb_sample->SetSampleTime(timestamp * 10);     // 100ns units
     rgb_sample->SetSampleDuration(frame_duration_);
 
     // Convert RGB32 -> NV12
@@ -708,26 +679,48 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
 
-    UINT32 nv12_buffer_size = 0;
-    if (FAILED(MFCalculateImageSize(MFVideoFormat_NV12, width_, height_, &nv12_buffer_size))) {
-        nv12_buffer_size = static_cast<UINT32>(width_ * height_ * 3 / 2);
-    }
-    DWORD cc_cb = cc_info.cbSize > 0 ? cc_info.cbSize : static_cast<DWORD>(nv12_buffer_size);
-
     IMFSample* nv12_sample = nullptr;
-    hr = MFCreateSample(&nv12_sample);
-    if (FAILED(hr)) return false;
+    if ((cc_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
+        // Allocate an NV12 GPU surface for the converter output.
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = width_;
+        desc.Height = height_;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_NV12;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
 
-    IMFMediaBuffer* nv12_buffer = nullptr;
-    hr = MFCreateMemoryBuffer(cc_cb, &nv12_buffer);
-    if (FAILED(hr)) {
-        nv12_sample->Release();
-        return false;
+        ID3D11Texture2D* nv12_texture = nullptr;
+        hr = d3d_device_->CreateTexture2D(&desc, nullptr, &nv12_texture);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create NV12 texture: 0x" << std::hex << hr << std::endl;
+            return false;
+        }
+
+        hr = MFCreateSample(&nv12_sample);
+        if (FAILED(hr)) {
+            nv12_texture->Release();
+            return false;
+        }
+
+        IMFMediaBuffer* nv12_buffer = nullptr;
+        hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_texture, 0, FALSE, &nv12_buffer);
+        nv12_texture->Release();
+        if (FAILED(hr)) {
+            nv12_sample->Release();
+            std::cerr << "MFCreateDXGISurfaceBuffer (NV12) failed: 0x" << std::hex << hr << std::endl;
+            return false;
+        }
+
+        nv12_sample->AddBuffer(nv12_buffer);
+        nv12_buffer->Release();
+        nv12_sample->SetSampleTime(timestamp * 10);
+        nv12_sample->SetSampleDuration(frame_duration_);
     }
-    nv12_sample->AddBuffer(nv12_buffer);
-    nv12_buffer->Release();
-    nv12_sample->SetSampleTime(timestamp * 10);
-    nv12_sample->SetSampleDuration(frame_duration_);
 
     MFT_OUTPUT_DATA_BUFFER cc_out = {};
     cc_out.dwStreamID = 0;
@@ -738,7 +731,7 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         cc_out.pEvents->Release();
     }
     if (FAILED(hr)) {
-        nv12_sample->Release();
+        if (nv12_sample) nv12_sample->Release();
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
             return true;
         }
@@ -746,9 +739,17 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
 
+    IMFSample* out_nv12 = cc_out.pSample ? cc_out.pSample : nv12_sample;
+    if (!out_nv12) {
+        return false;
+    }
+
+    out_nv12->SetSampleTime(timestamp * 10);
+    out_nv12->SetSampleDuration(frame_duration_);
+
     // Feed NV12 to H.264 encoder
-    hr = h264_encoder_->ProcessInput(0, nv12_sample, 0);
-    nv12_sample->Release();
+    hr = h264_encoder_->ProcessInput(0, out_nv12, 0);
+    out_nv12->Release();
     if (FAILED(hr)) {
         std::cerr << "H.264 encoder ProcessInput failed: 0x" << std::hex << hr << std::endl;
         return false;
