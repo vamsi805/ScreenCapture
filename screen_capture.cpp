@@ -284,6 +284,12 @@ private:
         frames_ctx->height = height_;
         frames_ctx->initial_pool_size = 4;
 
+        auto* d3d11_frames = reinterpret_cast<AVD3D11VAFramesContext*>(frames_ctx->hwctx);
+        if (d3d11_frames) {
+            // NVENC needs render-target capable surfaces.
+            d3d11_frames->BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        }
+
         if (av_hwframe_ctx_init(hw_frames_ctx_) < 0) {
             std::cerr << "FFmpeg: av_hwframe_ctx_init failed" << std::endl;
             return false;
