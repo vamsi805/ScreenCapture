@@ -106,67 +106,60 @@ HRESULT CreateH264Encoder(IMFTransform** out_encoder) {
 bool SetH264OutputType(IMFTransform* encoder, UINT32 width, UINT32 height, UINT32 fps) {
     if (!encoder) return false;
 
-    for (DWORD i = 0; ; ++i) {
-        IMFMediaType* type = nullptr;
-        HRESULT hr = encoder->GetOutputAvailableType(0, i, &type);
-        if (hr == MF_E_NO_MORE_TYPES) break;
-        if (FAILED(hr) || !type) continue;
+    IMFMediaType* type = nullptr;
+    HRESULT hr = MFCreateMediaType(&type);
+    if (FAILED(hr)) return false;
 
-        GUID subtype = GUID_NULL;
-        if (SUCCEEDED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == MFVideoFormat_H264) {
-            type->SetUINT32(MF_MT_AVG_BITRATE, 5000000);
-            type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-            MFSetAttributeSize(type, MF_MT_FRAME_SIZE, width, height);
-            MFSetAttributeRatio(type, MF_MT_FRAME_RATE, fps, 1);
-            MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-            // Baseline profile for broad compatibility (WebRTC-friendly).
-            type->SetUINT32(MF_MT_MPEG2_PROFILE, 66);
+    type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    type->SetUINT32(MF_MT_AVG_BITRATE, 5000000);
+    type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    MFSetAttributeSize(type, MF_MT_FRAME_SIZE, width, height);
+    MFSetAttributeRatio(type, MF_MT_FRAME_RATE, fps, 1);
+    MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    type->SetUINT32(MF_MT_MPEG2_PROFILE, 66); // Baseline
 
-            hr = encoder->SetOutputType(0, type, 0);
-            type->Release();
-            if (SUCCEEDED(hr)) {
-                return true;
-            }
-            continue;
-        }
-
-        type->Release();
+    hr = encoder->SetOutputType(0, type, MFT_SET_TYPE_TEST_ONLY);
+    if (SUCCEEDED(hr)) {
+        hr = encoder->SetOutputType(0, type, 0);
     }
+    type->Release();
 
-    return false;
+    if (FAILED(hr)) {
+        std::cerr << "SetOutputType failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+    return true;
 }
 
 bool SetH264InputType(IMFTransform* encoder, UINT32 width, UINT32 height, UINT32 fps) {
     if (!encoder) return false;
 
-    for (DWORD i = 0; ; ++i) {
-        IMFMediaType* type = nullptr;
-        HRESULT hr = encoder->GetInputAvailableType(0, i, &type);
-        if (hr == MF_E_NO_MORE_TYPES) break;
-        if (FAILED(hr) || !type) continue;
+    IMFMediaType* type = nullptr;
+    HRESULT hr = MFCreateMediaType(&type);
+    if (FAILED(hr)) return false;
 
-        GUID subtype = GUID_NULL;
-        if (SUCCEEDED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == MFVideoFormat_NV12) {
-            type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-            MFSetAttributeSize(type, MF_MT_FRAME_SIZE, width, height);
-            MFSetAttributeRatio(type, MF_MT_FRAME_RATE, fps, 1);
-            MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-            type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
-            type->SetUINT32(MF_MT_SAMPLE_SIZE, width * height * 3 / 2);
-            type->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
+    type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    MFSetAttributeSize(type, MF_MT_FRAME_SIZE, width, height);
+    MFSetAttributeRatio(type, MF_MT_FRAME_RATE, fps, 1);
+    MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
+    type->SetUINT32(MF_MT_SAMPLE_SIZE, width * height * 3 / 2);
+    type->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
 
-            hr = encoder->SetInputType(0, type, 0);
-            type->Release();
-            if (SUCCEEDED(hr)) {
-                return true;
-            }
-            continue;
-        }
-
-        type->Release();
+    hr = encoder->SetInputType(0, type, MFT_SET_TYPE_TEST_ONLY);
+    if (SUCCEEDED(hr)) {
+        hr = encoder->SetInputType(0, type, 0);
     }
+    type->Release();
 
-    return false;
+    if (FAILED(hr)) {
+        std::cerr << "SetInputType failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+    return true;
 }
 }  // namespace
 
