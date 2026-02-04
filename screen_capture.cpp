@@ -102,6 +102,72 @@ HRESULT CreateH264Encoder(IMFTransform** out_encoder) {
                           IID_PPV_ARGS(out_encoder));
     return hr;
 }
+
+bool SetH264OutputType(IMFTransform* encoder, UINT32 width, UINT32 height, UINT32 fps) {
+    if (!encoder) return false;
+
+    for (DWORD i = 0; ; ++i) {
+        IMFMediaType* type = nullptr;
+        HRESULT hr = encoder->GetOutputAvailableType(0, i, &type);
+        if (hr == MF_E_NO_MORE_TYPES) break;
+        if (FAILED(hr) || !type) continue;
+
+        GUID subtype = GUID_NULL;
+        if (SUCCEEDED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == MFVideoFormat_H264) {
+            type->SetUINT32(MF_MT_AVG_BITRATE, 5000000);
+            type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+            MFSetAttributeSize(type, MF_MT_FRAME_SIZE, width, height);
+            MFSetAttributeRatio(type, MF_MT_FRAME_RATE, fps, 1);
+            MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+            // Baseline profile for broad compatibility (WebRTC-friendly).
+            type->SetUINT32(MF_MT_MPEG2_PROFILE, 66);
+
+            hr = encoder->SetOutputType(0, type, 0);
+            type->Release();
+            if (SUCCEEDED(hr)) {
+                return true;
+            }
+            continue;
+        }
+
+        type->Release();
+    }
+
+    return false;
+}
+
+bool SetH264InputType(IMFTransform* encoder, UINT32 width, UINT32 height, UINT32 fps) {
+    if (!encoder) return false;
+
+    for (DWORD i = 0; ; ++i) {
+        IMFMediaType* type = nullptr;
+        HRESULT hr = encoder->GetInputAvailableType(0, i, &type);
+        if (hr == MF_E_NO_MORE_TYPES) break;
+        if (FAILED(hr) || !type) continue;
+
+        GUID subtype = GUID_NULL;
+        if (SUCCEEDED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) && subtype == MFVideoFormat_NV12) {
+            type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+            MFSetAttributeSize(type, MF_MT_FRAME_SIZE, width, height);
+            MFSetAttributeRatio(type, MF_MT_FRAME_RATE, fps, 1);
+            MFSetAttributeRatio(type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+            type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
+            type->SetUINT32(MF_MT_SAMPLE_SIZE, width * height * 3 / 2);
+            type->SetUINT32(MF_MT_DEFAULT_STRIDE, width);
+
+            hr = encoder->SetInputType(0, type, 0);
+            type->Release();
+            if (SUCCEEDED(hr)) {
+                return true;
+            }
+            continue;
+        }
+
+        type->Release();
+    }
+
+    return false;
+}
 }  // namespace
 
 ScreenCaptureEncoder::ScreenCaptureEncoder()
@@ -357,39 +423,13 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     h264_encoder_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
                                   reinterpret_cast<ULONG_PTR>(dxgi_manager_));
 
-    IMFMediaType* enc_out = nullptr;
-    hr = MFCreateMediaType(&enc_out);
-    if (FAILED(hr)) return false;
-    enc_out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    enc_out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-    enc_out->SetUINT32(MF_MT_AVG_BITRATE, 5000000);
-    enc_out->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeSize(enc_out, MF_MT_FRAME_SIZE, width_, height_);
-    MFSetAttributeRatio(enc_out, MF_MT_FRAME_RATE, fps_, 1);
-    MFSetAttributeRatio(enc_out, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-    hr = h264_encoder_->SetOutputType(0, enc_out, 0);
-    enc_out->Release();
-    if (FAILED(hr)) {
-        std::cerr << "Failed to set H.264 encoder output type: 0x" << std::hex << hr << std::endl;
+    if (!SetH264OutputType(h264_encoder_, width_, height_, fps_)) {
+        std::cerr << "Failed to set H.264 encoder output type" << std::endl;
         return false;
     }
 
-    // Input type must be set after output type for the H.264 encoder.
-    IMFMediaType* enc_in = nullptr;
-    hr = MFCreateMediaType(&enc_in);
-    if (FAILED(hr)) return false;
-    enc_in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    enc_in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    enc_in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeSize(enc_in, MF_MT_FRAME_SIZE, width_, height_);
-    MFSetAttributeRatio(enc_in, MF_MT_FRAME_RATE, fps_, 1);
-    MFSetAttributeRatio(enc_in, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-    hr = h264_encoder_->SetInputType(0, enc_in, 0);
-    enc_in->Release();
-    if (FAILED(hr)) {
-        std::cerr << "Failed to set H.264 encoder input type: 0x" << std::hex << hr << std::endl;
+    if (!SetH264InputType(h264_encoder_, width_, height_, fps_)) {
+        std::cerr << "Failed to set H.264 encoder input type" << std::endl;
         return false;
     }
 
