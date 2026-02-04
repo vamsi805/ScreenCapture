@@ -81,7 +81,7 @@ HRESULT CreateH264Encoder(IMFTransform** out_encoder) {
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
     MFT_REGISTER_TYPE_INFO out_type = { MFMediaType_Video, MFVideoFormat_H264 };
-    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+    HRESULT  hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
                    MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
                    nullptr, &out_type, &activates, &count);
     if (SUCCEEDED(hr) && count > 0) {
