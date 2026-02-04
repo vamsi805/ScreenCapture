@@ -232,6 +232,7 @@ bool ScreenCaptureEncoder::Initialize(int width, int height, int fps, const std:
         return false;
     }
     
+    std::cout << "Initializing video encoder..." << std::endl;
     if (!InitializeVideoEncoder()) {
         std::cerr << "Failed to initialize video encoder" << std::endl;
         return false;
@@ -358,6 +359,8 @@ bool ScreenCaptureEncoder::InitializeDuplication() {
 bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     HRESULT hr;
 
+    std::cout << "[Encoder] Initializing GPU pipeline..." << std::endl;
+
     // Create GPU video processor (RGB32 -> NV12)
     hr = CoCreateInstance(CLSID_VideoProcessorMFT, nullptr, CLSCTX_INPROC_SERVER,
                           IID_PPV_ARGS(&color_converter_));
@@ -365,6 +368,7 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
         std::cerr << "Failed to create video processor MFT: 0x" << std::hex << hr << std::endl;
         return false;
     }
+    std::cout << "[Encoder] Video processor MFT created" << std::endl;
 
     IMFAttributes* cc_attrs = nullptr;
     if (SUCCEEDED(color_converter_->GetAttributes(&cc_attrs)) && cc_attrs) {
@@ -373,6 +377,7 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     }
     color_converter_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
                                      reinterpret_cast<ULONG_PTR>(dxgi_manager_));
+    std::cout << "[Encoder] Video processor D3D manager set" << std::endl;
 
     IMFMediaType* rgb_type = nullptr;
     hr = MFCreateMediaType(&rgb_type);
@@ -390,6 +395,7 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
         std::cerr << "Failed to set color converter input type: 0x" << std::hex << hr << std::endl;
         return false;
     }
+    std::cout << "[Encoder] Video processor input type set" << std::endl;
 
     IMFMediaType* nv12_type = nullptr;
     hr = MFCreateMediaType(&nv12_type);
@@ -407,6 +413,7 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
         std::cerr << "Failed to set color converter output type: 0x" << std::hex << hr << std::endl;
         return false;
     }
+    std::cout << "[Encoder] Video processor output type set" << std::endl;
 
     // Create H.264 encoder MFT (hardware-first)
     hr = CreateH264Encoder(&h264_encoder_);
@@ -414,6 +421,7 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
         std::cerr << "Failed to create H.264 encoder: 0x" << std::hex << hr << std::endl;
         return false;
     }
+    std::cout << "[Encoder] H.264 encoder created" << std::endl;
 
     IMFAttributes* enc_attrs = nullptr;
     if (SUCCEEDED(h264_encoder_->GetAttributes(&enc_attrs)) && enc_attrs) {
@@ -422,16 +430,19 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     }
     h264_encoder_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
                                   reinterpret_cast<ULONG_PTR>(dxgi_manager_));
+    std::cout << "[Encoder] H.264 encoder D3D manager set" << std::endl;
 
     if (!SetH264OutputType(h264_encoder_, width_, height_, fps_)) {
         std::cerr << "Failed to set H.264 encoder output type" << std::endl;
         return false;
     }
+    std::cout << "[Encoder] H.264 encoder output type set" << std::endl;
 
     if (!SetH264InputType(h264_encoder_, width_, height_, fps_)) {
         std::cerr << "Failed to set H.264 encoder input type" << std::endl;
         return false;
     }
+    std::cout << "[Encoder] H.264 encoder input type set" << std::endl;
 
     IMFMediaType* current_out = nullptr;
     hr = h264_encoder_->GetOutputCurrentType(0, &current_out);
