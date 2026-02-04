@@ -36,6 +36,19 @@ target_link_libraries(ScreenCaptureEncoder
     strmiids       # Additional Media Foundation IDs
 )
 
+# FFmpeg (NVENC) - set FFMPEG_ROOT to your FFmpeg install path
+set(FFMPEG_ROOT "" CACHE PATH "Path to FFmpeg install (with include/lib)")
+find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h HINTS ${FFMPEG_ROOT}/include)
+find_library(AVCODEC_LIB NAMES avcodec avcodec-60 avcodec-59 HINTS ${FFMPEG_ROOT}/lib)
+find_library(AVUTIL_LIB NAMES avutil avutil-58 avutil-57 HINTS ${FFMPEG_ROOT}/lib)
+
+if (FFMPEG_INCLUDE_DIR AND AVCODEC_LIB AND AVUTIL_LIB)
+    target_include_directories(ScreenCaptureEncoder PRIVATE ${FFMPEG_INCLUDE_DIR})
+    target_link_libraries(ScreenCaptureEncoder ${AVCODEC_LIB} ${AVUTIL_LIB})
+else()
+    message(FATAL_ERROR "FFmpeg not found. Set FFMPEG_ROOT to your FFmpeg install path.")
+endif()
+
 # Compiler flags for Windows
 if(MSVC)
     # /W4 = Warning level 4 (high)

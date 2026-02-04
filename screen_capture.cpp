@@ -1,5 +1,15 @@
 #include "screen_capture.h"
-#include <wmcodecdsp.h> // CLSID_CMSH264EncoderMFT
+#include <wmcodecdsp.h> // CLSID_CMSH264EncoderMFT (fallback if needed)
+#include <errno.h>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
+#include <libavutil/error.h>
+#include <libavutil/rational.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
+}
 
 namespace {
 void AppendStartCode(std::vector<uint8_t>& out) {
@@ -74,6 +84,225 @@ bool ContainsKeyframe(const std::vector<uint8_t>& data) {
     return false;
 }
 
+}  // namespace
+
+class FfmpegNvencEncoder {
+public:
+    FfmpegNvencEncoder()
+        : codec_ctx_(nullptr)
+        , hw_device_ctx_(nullptr)
+        , hw_frames_ctx_(nullptr)
+        , device_(nullptr)
+        , context_(nullptr)
+        , width_(0)
+        , height_(0)
+        , fps_(0) {
+    }
+
+    bool Initialize(ID3D11Device* device, ID3D11DeviceContext* context,
+                    int width, int height, int fps, int bitrate) {
+        if (!device) return false;
+
+        width_ = width;
+        height_ = height;
+        fps_ = fps;
+        device_ = device;
+        context_ = context;
+        device_->AddRef();
+        if (context_) context_->AddRef();
+
+        const AVCodec* codec = avcodec_find_encoder_by_name("h264_nvenc");
+        if (!codec) {
+            std::cerr << "FFmpeg: h264_nvenc encoder not found" << std::endl;
+            return false;
+        }
+
+        codec_ctx_ = avcodec_alloc_context3(codec);
+        if (!codec_ctx_) {
+            std::cerr << "FFmpeg: failed to allocate codec context" << std::endl;
+            return false;
+        }
+
+        codec_ctx_->width = width_;
+        codec_ctx_->height = height_;
+        codec_ctx_->time_base = AVRational{1, fps_};
+        codec_ctx_->framerate = AVRational{fps_, 1};
+        codec_ctx_->gop_size = fps_ * 2;
+        codec_ctx_->max_b_frames = 0;
+        codec_ctx_->bit_rate = bitrate;
+        codec_ctx_->pix_fmt = AV_PIX_FMT_D3D11;
+
+        // Low-latency, WebRTC-friendly defaults.
+        av_opt_set(codec_ctx_->priv_data, "preset", "p1", 0);
+        av_opt_set(codec_ctx_->priv_data, "tune", "ll", 0);
+        av_opt_set(codec_ctx_->priv_data, "rc", "cbr", 0);
+        av_opt_set(codec_ctx_->priv_data, "profile", "baseline", 0);
+        av_opt_set(codec_ctx_->priv_data, "repeat_headers", "1", 0);
+
+        if (!InitHwDevice()) {
+            return false;
+        }
+
+        if (avcodec_open2(codec_ctx_, codec, nullptr) < 0) {
+            std::cerr << "FFmpeg: avcodec_open2 failed" << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+
+    AVFrame* AcquireFrame() {
+        if (!codec_ctx_ || !hw_frames_ctx_) return nullptr;
+
+        AVFrame* frame = av_frame_alloc();
+        if (!frame) return nullptr;
+
+        frame->format = AV_PIX_FMT_D3D11;
+        frame->width = width_;
+        frame->height = height_;
+        frame->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_);
+
+        if (av_hwframe_get_buffer(hw_frames_ctx_, frame, 0) < 0) {
+            av_frame_free(&frame);
+            return nullptr;
+        }
+
+        return frame;
+    }
+
+    bool GetFrameTexture(AVFrame* frame, ID3D11Texture2D** texture, UINT* subresource) {
+        if (!frame || !texture || !subresource) return false;
+        auto* desc = reinterpret_cast<AVD3D11FrameDescriptor*>(frame->data[0]);
+        if (!desc || !desc->texture) return false;
+        *texture = desc->texture;
+        *subresource = desc->index;
+        return true;
+    }
+
+    bool EncodeFrame(AVFrame* frame, uint64_t timestamp_us, std::vector<EncodedFrame>& out_frames) {
+        if (!codec_ctx_ || !frame) return false;
+
+        int64_t pts = av_rescale_q(static_cast<int64_t>(timestamp_us), AVRational{1, 1000000}, codec_ctx_->time_base);
+        frame->pts = pts;
+
+        int ret = avcodec_send_frame(codec_ctx_, frame);
+        av_frame_free(&frame);
+        if (ret < 0) {
+            return false;
+        }
+
+        AVPacket pkt;
+        av_init_packet(&pkt);
+
+        while (ret >= 0) {
+            ret = avcodec_receive_packet(codec_ctx_, &pkt);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                break;
+            }
+            if (ret < 0) {
+                av_packet_unref(&pkt);
+                return false;
+            }
+
+            EncodedFrame out;
+            if (pkt.size >= 4 &&
+                pkt.data[0] == 0x00 && pkt.data[1] == 0x00 &&
+                (pkt.data[2] == 0x01 || (pkt.data[2] == 0x00 && pkt.data[3] == 0x01))) {
+                out.data.assign(pkt.data, pkt.data + pkt.size);
+            } else {
+                ConvertLengthPrefixedToAnnexB(pkt.data, pkt.size, out.data);
+                if (out.data.empty()) {
+                    out.data.assign(pkt.data, pkt.data + pkt.size);
+                }
+            }
+
+            out.timestamp = timestamp_us;
+            out.is_keyframe = (pkt.flags & AV_PKT_FLAG_KEY) != 0;
+            out.is_audio = false;
+            out_frames.push_back(std::move(out));
+
+            av_packet_unref(&pkt);
+        }
+
+        return true;
+    }
+
+    void Shutdown() {
+        if (codec_ctx_) {
+            avcodec_free_context(&codec_ctx_);
+            codec_ctx_ = nullptr;
+        }
+
+        if (hw_frames_ctx_) {
+            av_buffer_unref(&hw_frames_ctx_);
+            hw_frames_ctx_ = nullptr;
+        }
+
+        if (hw_device_ctx_) {
+            av_buffer_unref(&hw_device_ctx_);
+            hw_device_ctx_ = nullptr;
+        }
+
+        if (context_) {
+            context_->Release();
+            context_ = nullptr;
+        }
+        if (device_) {
+            device_->Release();
+            device_ = nullptr;
+        }
+    }
+
+private:
+    bool InitHwDevice() {
+        hw_device_ctx_ = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+        if (!hw_device_ctx_) {
+            std::cerr << "FFmpeg: av_hwdevice_ctx_alloc failed" << std::endl;
+            return false;
+        }
+
+        auto* device_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx_->data);
+        auto* d3d11_ctx = reinterpret_cast<AVD3D11VADeviceContext*>(device_ctx->hwctx);
+        d3d11_ctx->device = device_;
+        d3d11_ctx->device_context = context_;
+
+        if (av_hwdevice_ctx_init(hw_device_ctx_) < 0) {
+            std::cerr << "FFmpeg: av_hwdevice_ctx_init failed" << std::endl;
+            return false;
+        }
+
+        hw_frames_ctx_ = av_hwframe_ctx_alloc(hw_device_ctx_);
+        if (!hw_frames_ctx_) {
+            std::cerr << "FFmpeg: av_hwframe_ctx_alloc failed" << std::endl;
+            return false;
+        }
+
+        auto* frames_ctx = reinterpret_cast<AVHWFramesContext*>(hw_frames_ctx_->data);
+        frames_ctx->format = AV_PIX_FMT_D3D11;
+        frames_ctx->sw_format = AV_PIX_FMT_NV12;
+        frames_ctx->width = width_;
+        frames_ctx->height = height_;
+        frames_ctx->initial_pool_size = 4;
+
+        if (av_hwframe_ctx_init(hw_frames_ctx_) < 0) {
+            std::cerr << "FFmpeg: av_hwframe_ctx_init failed" << std::endl;
+            return false;
+        }
+
+        codec_ctx_->hw_frames_ctx = av_buffer_ref(hw_frames_ctx_);
+        return true;
+    }
+
+    AVCodecContext* codec_ctx_;
+    AVBufferRef* hw_device_ctx_;
+    AVBufferRef* hw_frames_ctx_;
+    ID3D11Device* device_;
+    ID3D11DeviceContext* context_;
+    int width_;
+    int height_;
+    int fps_;
+};
+
 HRESULT CreateH264Encoder(IMFTransform** out_encoder) {
     if (!out_encoder) return E_POINTER;
     *out_encoder = nullptr;
@@ -81,7 +310,7 @@ HRESULT CreateH264Encoder(IMFTransform** out_encoder) {
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
     MFT_REGISTER_TYPE_INFO out_type = { MFMediaType_Video, MFVideoFormat_H264 };
-    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+    HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
                    MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
                    nullptr, &out_type, &activates, &count);
     if (SUCCEEDED(hr) && count > 0) {
@@ -169,8 +398,6 @@ bool SetH264InputType(IMFTransform* encoder, UINT32 width, UINT32 height, UINT32
     std::cerr << "SetInputType failed: 0x" << std::hex << hr << std::endl;
     return false;
 }
-}  // namespace
-
 ScreenCaptureEncoder::ScreenCaptureEncoder()
     : d3d_device_(nullptr)              // NULL until InitializeD3D11() succeeds
     , d3d_context_(nullptr)
@@ -178,8 +405,7 @@ ScreenCaptureEncoder::ScreenCaptureEncoder()
     , dxgi_manager_(nullptr)
     , reset_token_(0)
     , color_converter_(nullptr)
-    , h264_encoder_(nullptr)
-    , sent_sequence_header_(false)
+    , ffmpeg_encoder_(nullptr)
     , pipe_handle_(INVALID_HANDLE_VALUE)  // Invalid handle value from Windows
     , width_(1920)                         // Default 1080p width
     , height_(1080)                        // Default 1080p height
@@ -416,59 +642,16 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     }
     std::cout << "[Encoder] Video processor output type set" << std::endl;
 
-    // Create H.264 encoder MFT (hardware-first)
-    hr = CreateH264Encoder(&h264_encoder_);
-    if (FAILED(hr) || !h264_encoder_) {
-        std::cerr << "Failed to create H.264 encoder: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-    std::cout << "[Encoder] H.264 encoder created" << std::endl;
-
-    IMFAttributes* enc_attrs = nullptr;
-    if (SUCCEEDED(h264_encoder_->GetAttributes(&enc_attrs)) && enc_attrs) {
-        enc_attrs->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
-        enc_attrs->Release();
-    }
-    h264_encoder_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
-                                  reinterpret_cast<ULONG_PTR>(dxgi_manager_));
-    std::cout << "[Encoder] H.264 encoder D3D manager set" << std::endl;
-
-    std::cout << "[Encoder] Setting H.264 encoder output type..." << std::endl;
-    if (!SetH264OutputType(h264_encoder_, width_, height_, fps_)) {
-        std::cerr << "Failed to set H.264 encoder output type" << std::endl;
-        return false;
-    }
-    std::cout << "[Encoder] H.264 encoder output type set" << std::endl;
-
-    std::cout << "[Encoder] Setting H.264 encoder input type..." << std::endl;
-    if (!SetH264InputType(h264_encoder_, width_, height_, fps_)) {
-        std::cerr << "Failed to set H.264 encoder input type" << std::endl;
-        return false;
-    }
-    std::cout << "[Encoder] H.264 encoder input type set" << std::endl;
-
-    IMFMediaType* current_out = nullptr;
-    hr = h264_encoder_->GetOutputCurrentType(0, &current_out);
-    if (SUCCEEDED(hr) && current_out) {
-        UINT32 blob_size = 0;
-        if (SUCCEEDED(current_out->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &blob_size)) && blob_size > 0) {
-            std::vector<uint8_t> avcc(blob_size);
-            if (SUCCEEDED(current_out->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, avcc.data(), blob_size, nullptr))) {
-                h264_sequence_header_.clear();
-                ConvertAvccToAnnexB(avcc.data(), avcc.size(), h264_sequence_header_);
-            }
-        }
-        current_out->Release();
-    }
-
     color_converter_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     color_converter_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-    h264_encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    h264_encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
-    sent_sequence_header_ = false;
+    ffmpeg_encoder_ = std::make_unique<FfmpegNvencEncoder>();
+    if (!ffmpeg_encoder_->Initialize(d3d_device_, d3d_context_, width_, height_, fps_, 5000000)) {
+        std::cerr << "Failed to initialize FFmpeg NVENC encoder" << std::endl;
+        return false;
+    }
 
-    std::cout << "Video encoder initialized successfully (raw H.264 Annex-B)" << std::endl;
+    std::cout << "Video encoder initialized successfully (NVENC via FFmpeg)" << std::endl;
     return true;
 }
 
@@ -548,11 +731,10 @@ void ScreenCaptureEncoder::Stop() {
         pipe_thread_.join();
     }
     
-    // Cleanup COM objects
-    if (h264_encoder_) {
-        h264_encoder_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        h264_encoder_->Release();
-        h264_encoder_ = nullptr;
+    // Cleanup encoder
+    if (ffmpeg_encoder_) {
+        ffmpeg_encoder_->Shutdown();
+        ffmpeg_encoder_.reset();
     }
 
     if (color_converter_) {
@@ -734,48 +916,39 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
 
-    IMFSample* nv12_sample = nullptr;
-    if ((cc_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
-        // Allocate an NV12 GPU surface for the converter output.
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = width_;
-        desc.Height = height_;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_NV12;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        desc.CPUAccessFlags = 0;
-        desc.MiscFlags = 0;
-
-        ID3D11Texture2D* nv12_texture = nullptr;
-        hr = d3d_device_->CreateTexture2D(&desc, nullptr, &nv12_texture);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create NV12 texture: 0x" << std::hex << hr << std::endl;
-            return false;
-        }
-
-        hr = MFCreateSample(&nv12_sample);
-        if (FAILED(hr)) {
-            nv12_texture->Release();
-            return false;
-        }
-
-        IMFMediaBuffer* nv12_buffer = nullptr;
-        hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_texture, 0, FALSE, &nv12_buffer);
-        nv12_texture->Release();
-        if (FAILED(hr)) {
-            nv12_sample->Release();
-            std::cerr << "MFCreateDXGISurfaceBuffer (NV12) failed: 0x" << std::hex << hr << std::endl;
-            return false;
-        }
-
-        nv12_sample->AddBuffer(nv12_buffer);
-        nv12_buffer->Release();
-        nv12_sample->SetSampleTime(timestamp * 10);
-        nv12_sample->SetSampleDuration(frame_duration_);
+    // Option A: use FFmpeg's NV12 surfaces as the video processor output target.
+    AVFrame* nv12_frame = ffmpeg_encoder_ ? ffmpeg_encoder_->AcquireFrame() : nullptr;
+    if (!nv12_frame) {
+        return false;
     }
+
+    ID3D11Texture2D* nv12_texture = nullptr;
+    UINT nv12_subresource = 0;
+    if (!ffmpeg_encoder_->GetFrameTexture(nv12_frame, &nv12_texture, &nv12_subresource)) {
+        av_frame_free(&nv12_frame);
+        return false;
+    }
+
+    IMFSample* nv12_sample = nullptr;
+    hr = MFCreateSample(&nv12_sample);
+    if (FAILED(hr)) {
+        av_frame_free(&nv12_frame);
+        return false;
+    }
+
+    IMFMediaBuffer* nv12_buffer = nullptr;
+    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_texture, nv12_subresource, FALSE, &nv12_buffer);
+    if (FAILED(hr)) {
+        nv12_sample->Release();
+        av_frame_free(&nv12_frame);
+        std::cerr << "MFCreateDXGISurfaceBuffer (NV12) failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    nv12_sample->AddBuffer(nv12_buffer);
+    nv12_buffer->Release();
+    nv12_sample->SetSampleTime(timestamp * 10);
+    nv12_sample->SetSampleDuration(frame_duration_);
 
     MFT_OUTPUT_DATA_BUFFER cc_out = {};
     cc_out.dwStreamID = 0;
@@ -786,7 +959,8 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         cc_out.pEvents->Release();
     }
     if (FAILED(hr)) {
-        if (nv12_sample) nv12_sample->Release();
+        nv12_sample->Release();
+        av_frame_free(&nv12_frame);
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
             return true;
         }
@@ -794,107 +968,19 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
 
-    IMFSample* out_nv12 = cc_out.pSample ? cc_out.pSample : nv12_sample;
-    if (!out_nv12) {
+    nv12_sample->Release();
+
+    std::vector<EncodedFrame> out_frames;
+    if (!ffmpeg_encoder_ ||
+        !ffmpeg_encoder_->EncodeFrame(nv12_frame, timestamp, out_frames)) {
         return false;
     }
 
-    out_nv12->SetSampleTime(timestamp * 10);
-    out_nv12->SetSampleDuration(frame_duration_);
-
-    // Feed NV12 to H.264 encoder
-    hr = h264_encoder_->ProcessInput(0, out_nv12, 0);
-    out_nv12->Release();
-    if (FAILED(hr)) {
-        std::cerr << "H.264 encoder ProcessInput failed: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-
-    MFT_OUTPUT_STREAM_INFO enc_info = {};
-    hr = h264_encoder_->GetOutputStreamInfo(0, &enc_info);
-    if (FAILED(hr)) {
-        std::cerr << "H.264 encoder GetOutputStreamInfo failed: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-
-    while (true) {
-        IMFSample* enc_sample = nullptr;
-        if ((enc_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
-            DWORD enc_cb = enc_info.cbSize > 0 ? enc_info.cbSize : (width_ * height_ * 4);
-            IMFMediaBuffer* enc_buffer = nullptr;
-            if (FAILED(MFCreateSample(&enc_sample))) return false;
-            if (FAILED(MFCreateMemoryBuffer(enc_cb, &enc_buffer))) {
-                enc_sample->Release();
-                return false;
-            }
-            enc_sample->AddBuffer(enc_buffer);
-            enc_buffer->Release();
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        for (auto& frame : out_frames) {
+            frame_queue_.push(std::move(frame));
         }
-
-        MFT_OUTPUT_DATA_BUFFER enc_out = {};
-        enc_out.dwStreamID = 0;
-        enc_out.pSample = enc_sample;
-        DWORD enc_status = 0;
-        hr = h264_encoder_->ProcessOutput(0, 1, &enc_out, &enc_status);
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            if (enc_out.pEvents) enc_out.pEvents->Release();
-            if (enc_sample) enc_sample->Release();
-            break;
-        }
-        if (FAILED(hr)) {
-            if (enc_out.pEvents) enc_out.pEvents->Release();
-            if (enc_sample) enc_sample->Release();
-            std::cerr << "H.264 encoder ProcessOutput failed: 0x" << std::hex << hr << std::endl;
-            return false;
-        }
-
-        IMFSample* out_sample = enc_out.pSample;
-        IMFMediaBuffer* out_buffer = nullptr;
-        if (SUCCEEDED(out_sample->ConvertToContiguousBuffer(&out_buffer))) {
-            BYTE* out_data = nullptr;
-            DWORD out_max = 0;
-            DWORD out_len = 0;
-            if (SUCCEEDED(out_buffer->Lock(&out_data, &out_max, &out_len))) {
-                if (out_len > 0) {
-                    std::vector<uint8_t> annexb;
-                    if (out_len >= 4 &&
-                        out_data[0] == 0x00 && out_data[1] == 0x00 &&
-                        (out_data[2] == 0x01 || (out_data[2] == 0x00 && out_data[3] == 0x01))) {
-                        annexb.assign(out_data, out_data + out_len);
-                    } else if (!ConvertLengthPrefixedToAnnexB(out_data, out_len, annexb)) {
-                        annexb.assign(out_data, out_data + out_len);
-                    }
-
-                    if (!sent_sequence_header_ && !h264_sequence_header_.empty()) {
-                        EncodedFrame header_frame;
-                        header_frame.data = h264_sequence_header_;
-                        header_frame.timestamp = timestamp;
-                        header_frame.is_keyframe = false;
-                        header_frame.is_audio = false;
-                        {
-                            std::lock_guard<std::mutex> lock(queue_mutex_);
-                            frame_queue_.push(std::move(header_frame));
-                        }
-                        sent_sequence_header_ = true;
-                    }
-
-                    EncodedFrame frame;
-                    frame.data = std::move(annexb);
-                    frame.timestamp = timestamp;
-                    frame.is_keyframe = ContainsKeyframe(frame.data);
-                    frame.is_audio = false;
-                    {
-                        std::lock_guard<std::mutex> lock(queue_mutex_);
-                        frame_queue_.push(std::move(frame));
-                    }
-                }
-                out_buffer->Unlock();
-            }
-            out_buffer->Release();
-        }
-
-        if (enc_out.pEvents) enc_out.pEvents->Release();
-        if (out_sample) out_sample->Release();
     }
 
     return true;
