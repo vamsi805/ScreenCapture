@@ -26,6 +26,8 @@
 #include <atomic>
 #include <cstdint>
 
+class FfmpegNvencEncoder;
+
 // Link required libraries - tells linker to include these .lib files
 #pragma comment(lib, "d3d11.lib")        // Direct3D 11 library
 #pragma comment(lib, "dxgi.lib")         // DXGI library
@@ -102,9 +104,7 @@ private:
     
     // Media Foundation objects for video encoding
     IMFTransform* color_converter_;                     // RGB32 -> NV12 converter
-    IMFTransform* h264_encoder_;                        // H.264 encoder MFT
-    std::vector<uint8_t> h264_sequence_header_;         // SPS/PPS as Annex-B
-    bool sent_sequence_header_;                         // Sent SPS/PPS yet
+    std::unique_ptr<FfmpegNvencEncoder> ffmpeg_encoder_; // NVENC encoder via FFmpeg
     
        
     // Named pipe for IPC
