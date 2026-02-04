@@ -30,6 +30,7 @@ target_link_libraries(ScreenCaptureEncoder
     mf             # Core Media Foundation (MFCreateSampleGrabberSinkActivate)
     mfuuid         # Media Foundation UUIDs
     mfreadwrite    # Media Foundation Read/Write
+    wmcodecdspuuid # H.264 encoder CLSIDs
     ole32          # COM
     shlwapi      
     strmiids       # Additional Media Foundation IDs

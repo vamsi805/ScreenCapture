@@ -1,4 +1,5 @@
 #include "screen_capture.h"
+#include <wmcodecdsp.h> // CLSID_CMSH264EncoderMFT
 
 namespace {
 void AppendStartCode(std::vector<uint8_t>& out) {

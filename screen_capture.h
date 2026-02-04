@@ -33,6 +33,7 @@
 #pragma comment(lib, "mf.lib")           // Core Media Foundation library (MFCreateSampleGrabberSinkActivate)
 #pragma comment(lib, "mfuuid.lib")       // Media Foundation UUIDs
 #pragma comment(lib, "mfreadwrite.lib")  // Media Foundation sink writer
+#pragma comment(lib, "wmcodecdspuuid.lib") // H.264 encoder CLSIDs
 #pragma comment(lib, "ole32.lib")        // COM library for object creation
 #pragma comment(lib, "shlwapi.lib")      // Shell utilities (for QISearch)
 
