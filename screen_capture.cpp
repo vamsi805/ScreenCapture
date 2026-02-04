@@ -707,11 +707,11 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
 
-    DWORD nv12_buffer_size = 0;
+    UINT32 nv12_buffer_size = 0;
     if (FAILED(MFCalculateImageSize(MFVideoFormat_NV12, width_, height_, &nv12_buffer_size))) {
-        nv12_buffer_size = width_ * height_ * 3 / 2;
+        nv12_buffer_size = static_cast<UINT32>(width_ * height_ * 3 / 2);
     }
-    DWORD cc_cb = cc_info.cbSize > 0 ? cc_info.cbSize : nv12_buffer_size;
+    DWORD cc_cb = cc_info.cbSize > 0 ? cc_info.cbSize : static_cast<DWORD>(nv12_buffer_size);
 
     IMFSample* nv12_sample = nullptr;
     hr = MFCreateSample(&nv12_sample);
