@@ -37,9 +37,9 @@ target_link_libraries(ScreenCaptureEncoder
 )
 
 # FFmpeg (NVENC) - set FFMPEG_ROOT to your FFmpeg install path
-set(FFMPEG_ROOT "" CACHE PATH "Path to FFmpeg install (with include/lib)")
+set(FFMPEG_ROOT "C:/Users/vamsi/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-8.0.1-full_build-shared")
 find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h HINTS ${FFMPEG_ROOT}/include)
-find_library(AVCODEC_LIB NAMES avcodec avcodec-60 avcodec-59 HINTS ${FFMPEG_ROOT}/lib)
+find_library(AVCODEC_LIB NAMES avcodec avcodec-62 avcodec-59 HINTS ${FFMPEG_ROOT}/lib)
 find_library(AVUTIL_LIB NAMES avutil avutil-58 avutil-57 HINTS ${FFMPEG_ROOT}/lib)
 
 if (FFMPEG_INCLUDE_DIR AND AVCODEC_LIB AND AVUTIL_LIB)
