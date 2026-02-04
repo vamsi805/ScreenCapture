@@ -343,23 +343,6 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
         return false;
     }
 
-    IMFMediaType* enc_in = nullptr;
-    hr = MFCreateMediaType(&enc_in);
-    if (FAILED(hr)) return false;
-    enc_in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    enc_in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    enc_in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeSize(enc_in, MF_MT_FRAME_SIZE, width_, height_);
-    MFSetAttributeRatio(enc_in, MF_MT_FRAME_RATE, fps_, 1);
-    MFSetAttributeRatio(enc_in, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-    hr = h264_encoder_->SetInputType(0, enc_in, 0);
-    enc_in->Release();
-    if (FAILED(hr)) {
-        std::cerr << "Failed to set H.264 encoder input type: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-
     IMFMediaType* enc_out = nullptr;
     hr = MFCreateMediaType(&enc_out);
     if (FAILED(hr)) return false;
@@ -375,6 +358,24 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     enc_out->Release();
     if (FAILED(hr)) {
         std::cerr << "Failed to set H.264 encoder output type: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    // Input type must be set after output type for the H.264 encoder.
+    IMFMediaType* enc_in = nullptr;
+    hr = MFCreateMediaType(&enc_in);
+    if (FAILED(hr)) return false;
+    enc_in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    enc_in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    enc_in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    MFSetAttributeSize(enc_in, MF_MT_FRAME_SIZE, width_, height_);
+    MFSetAttributeRatio(enc_in, MF_MT_FRAME_RATE, fps_, 1);
+    MFSetAttributeRatio(enc_in, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+
+    hr = h264_encoder_->SetInputType(0, enc_in, 0);
+    enc_in->Release();
+    if (FAILED(hr)) {
+        std::cerr << "Failed to set H.264 encoder input type: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
