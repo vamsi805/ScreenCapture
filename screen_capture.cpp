@@ -432,12 +432,14 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
                                   reinterpret_cast<ULONG_PTR>(dxgi_manager_));
     std::cout << "[Encoder] H.264 encoder D3D manager set" << std::endl;
 
+    std::cout << "[Encoder] Setting H.264 encoder output type..." << std::endl;
     if (!SetH264OutputType(h264_encoder_, width_, height_, fps_)) {
         std::cerr << "Failed to set H.264 encoder output type" << std::endl;
         return false;
     }
     std::cout << "[Encoder] H.264 encoder output type set" << std::endl;
 
+    std::cout << "[Encoder] Setting H.264 encoder input type..." << std::endl;
     if (!SetH264InputType(h264_encoder_, width_, height_, fps_)) {
         std::cerr << "Failed to set H.264 encoder input type" << std::endl;
         return false;
