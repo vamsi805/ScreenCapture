@@ -1112,9 +1112,19 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
 
-    ID3D11Texture2D* converter_texture = nullptr;
-    hr = dxgi_buffer->GetResource(IID_PPV_ARGS(&converter_texture));
-    if (FAILED(hr)) {
+        ID3D11Texture2D* converter_texture = nullptr;
+        hr = dxgi_buffer->GetResource(IID_PPV_ARGS(&converter_texture));
+        if (FAILED(hr)) {
+            dxgi_buffer->Release();
+            output_sample->Release();
+            if (nv12_sample) {
+                nv12_sample->Release();
+            }
+            av_frame_free(&nvenc_frame);
+            return false;
+        }
+        UINT converter_subresource = 0;
+        dxgi_buffer->GetSubresourceIndex(&converter_subresource);
         dxgi_buffer->Release();
         output_sample->Release();
         if (nv12_sample) {
@@ -1127,9 +1137,10 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
     dxgi_buffer->GetSubresourceIndex(&converter_subresource);
     dxgi_buffer->Release();
 
-    d3d_context_->CopySubresourceRegion(nv12_texture, nv12_subresource, 0, 0, 0,
-                                        converter_texture, converter_subresource, nullptr);
-    converter_texture->Release();
+        d3d_context_->CopySubresourceRegion(nv12_texture, nv12_subresource, 0, 0, 0,
+                                            converter_texture, converter_subresource, nullptr);
+        converter_texture->Release();
+    }
     output_sample->Release();
     if (nv12_sample && nv12_sample != output_sample) {
         nv12_sample->Release();
