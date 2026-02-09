@@ -111,7 +111,6 @@ private:
     // Media Foundation objects for video encoding
     IMFTransform* color_converter_;                     // RGB32 -> NV12 converter
     std::unique_ptr<FfmpegNvencEncoder> ffmpeg_encoder_; // NVENC encoder via FFmpeg
-    ID3D11Texture2D* nv12_converter_texture_;           // NV12 texture for color converter output
     
        
     // Named pipe for IPC
