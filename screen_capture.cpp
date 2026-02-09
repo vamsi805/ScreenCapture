@@ -1,4 +1,4 @@
-#include "screen_capture.h"
+﻿#include "screen_capture.h"
 #include <wmcodecdsp.h> // CLSID_CMSH264EncoderMFT (fallback if needed)
 #include <errno.h>
 
@@ -287,7 +287,9 @@ private:
         auto* d3d11_frames = reinterpret_cast<AVD3D11VAFramesContext*>(frames_ctx->hwctx);
         if (d3d11_frames) {
             // NVENC needs render-target capable surfaces.
-            d3d11_frames->BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            d3d11_frames->BindFlags = D3D11_BIND_RENDER_TARGET |
+                D3D11_BIND_SHADER_RESOURCE;
+            d3d11_frames->MiscFlags = 0;
         }
 
         if (av_hwframe_ctx_init(hw_frames_ctx_) < 0) {
@@ -419,13 +421,56 @@ ScreenCaptureEncoder::ScreenCaptureEncoder()
     , height_(1080)                        // Default 1080p height
     , fps_(60)                             // Default 60 FPS
     , frame_duration_(0)
-    , running_(false)                      // Not running initially
+    , running_(false) 
+    , current_nv12_index_(0) 
 {
 }
 
 // Destructor - Cleanup is handled in Stop()
 ScreenCaptureEncoder::~ScreenCaptureEncoder() {
     Stop();  // Ensure everything is cleaned up
+}
+
+bool ScreenCaptureEncoder::CreateMFTexturePool() {
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width_;
+    desc.Height = height_;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+
+    // ✓ MF Video Processor needs BOTH render target AND shader resource
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = 0;
+
+    // ✓ CRITICAL: MF may need this for proper video processing
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;  // Allow sharing between MF components
+
+    nv12_mf_pool_.clear();
+
+    for (int i = 0; i < 4; ++i) {
+        ID3D11Texture2D* texture = nullptr;
+        HRESULT hr = d3d_device_->CreateTexture2D(&desc, nullptr, &texture);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create MF NV12 texture " << i
+                << ": 0x" << std::hex << hr << std::endl;
+
+            for (auto* t : nv12_mf_pool_) {
+                t->Release();
+            }
+            nv12_mf_pool_.clear();
+            return false;
+        }
+        nv12_mf_pool_.push_back(texture);
+        std::cout << "Created MF NV12 texture " << i << std::endl;
+    }
+
+    current_nv12_index_ = 0;
+    std::cout << "MF texture pool created successfully" << std::endl;
+    return true;
 }
 
 // Main initialization function - sets up all subsystems
@@ -596,6 +641,12 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
 
     std::cout << "[Encoder] Initializing GPU pipeline..." << std::endl;
 
+    if (!CreateMFTexturePool()) {
+        std::cerr << "Failed to create MF texture pool" << std::endl;
+        return false;
+    }
+
+
     // Create GPU video processor (RGB32 -> NV12)
     hr = CoCreateInstance(CLSID_VideoProcessorMFT, nullptr, CLSCTX_INPROC_SERVER,
                           IID_PPV_ARGS(&color_converter_));
@@ -743,9 +794,9 @@ void ScreenCaptureEncoder::Stop() {
     if (!running_) {
         return;  // Already stopped
     }
-    
+
     running_ = false;  // Clear atomic flag (threads will exit)
-    
+
     // Wait for threads to finish
     if (capture_thread_.joinable()) {
         capture_thread_.join();  // Block until thread exits
@@ -754,7 +805,7 @@ void ScreenCaptureEncoder::Stop() {
     if (pipe_thread_.joinable()) {
         pipe_thread_.join();
     }
-    
+
     // Cleanup encoder
     if (ffmpeg_encoder_) {
         ffmpeg_encoder_->Shutdown();
@@ -766,13 +817,13 @@ void ScreenCaptureEncoder::Stop() {
         color_converter_->Release();
         color_converter_ = nullptr;
     }
-
-    if (nv12_converter_texture_) {
-        nv12_converter_texture_->Release();
-        nv12_converter_texture_ = nullptr;
+    for (auto* texture : nv12_mf_pool_) {
+        if (texture) {
+            texture->Release();
+        }
     }
-    
-    
+    nv12_mf_pool_.clear();
+         
     if (desktop_duplication_) {
         desktop_duplication_->ReleaseFrame();  // Release any held frame
         desktop_duplication_->Release();
@@ -909,12 +960,8 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
     if (!texture) {
         return false;
     }
-    if (!nv12_converter_texture_) {
-        std::cerr << "NV12 converter texture not initialized" << std::endl;
-        return false;
-    }
 
-    // Wrap the GPU texture directly in an MF sample (no CPU readback).
+    // === STEP 1: Create RGB Input Sample ===
     IMFSample* rgb_sample = nullptr;
     HRESULT hr = MFCreateSample(&rgb_sample);
     if (FAILED(hr)) {
@@ -925,91 +972,153 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
     hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture, 0, FALSE, &rgb_buffer);
     if (FAILED(hr)) {
         rgb_sample->Release();
-        std::cerr << "MFCreateDXGISurfaceBuffer failed: 0x" << std::hex << hr << std::endl;
+        std::cerr << "MFCreateDXGISurfaceBuffer (RGB) failed: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
     rgb_sample->AddBuffer(rgb_buffer);
     rgb_buffer->Release();
-    rgb_sample->SetSampleTime(timestamp * 10);     // 100ns units
+    rgb_sample->SetSampleTime(timestamp * 10);
     rgb_sample->SetSampleDuration(frame_duration_);
 
-    // Convert RGB32 -> NV12
+    // === STEP 2: Send to Color Converter ===
     hr = color_converter_->ProcessInput(0, rgb_sample, 0);
-    rgb_sample->Release();
+    rgb_sample->Release();  // Can release now
+
     if (FAILED(hr)) {
         std::cerr << "Color converter ProcessInput failed: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
-    MFT_OUTPUT_STREAM_INFO cc_info = {};
-    hr = color_converter_->GetOutputStreamInfo(0, &cc_info);
+    // === STEP 3: Check Output Requirements ===
+    MFT_OUTPUT_STREAM_INFO stream_info = {};
+    hr = color_converter_->GetOutputStreamInfo(0, &stream_info);
     if (FAILED(hr)) {
-        std::cerr << "Color converter GetOutputStreamInfo failed: 0x" << std::hex << hr << std::endl;
+        std::cerr << "GetOutputStreamInfo failed: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
-    // Option A: use a dedicated NV12 surface for the video processor output.
-    AVFrame* nv12_frame = ffmpeg_encoder_ ? ffmpeg_encoder_->AcquireFrame() : nullptr;
-    if (!nv12_frame) {
-        return false;
+    std::cout << "[MFT] Output flags: 0x" << std::hex << stream_info.dwFlags << std::endl;
+    std::cout << "[MFT] Output size: " << std::dec << stream_info.cbSize << std::endl;
+
+    // === STEP 4: Let MFT Provide or Allocate Sample ===
+    MFT_OUTPUT_DATA_BUFFER output_buffer = {};
+    output_buffer.dwStreamID = 0;
+    output_buffer.pSample = nullptr;  // ✓ Let MFT allocate if it wants
+    output_buffer.pEvents = nullptr;
+
+    DWORD status = 0;
+    hr = color_converter_->ProcessOutput(0, 1, &output_buffer, &status);
+
+    if (output_buffer.pEvents) {
+        output_buffer.pEvents->Release();
     }
 
-    ID3D11Texture2D* nv12_texture = nullptr;
-    UINT nv12_subresource = 0;
-    if (!ffmpeg_encoder_->GetFrameTexture(nv12_frame, &nv12_texture, &nv12_subresource)) {
-        av_frame_free(&nv12_frame);
-        return false;
-    }
-
-    IMFSample* nv12_sample = nullptr;
-    hr = MFCreateSample(&nv12_sample);
     if (FAILED(hr)) {
-        av_frame_free(&nv12_frame);
-        return false;
-    }
-
-    IMFMediaBuffer* nv12_buffer = nullptr;
-    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_converter_texture_, 0, FALSE, &nv12_buffer);
-    if (FAILED(hr)) {
-        nv12_sample->Release();
-        av_frame_free(&nv12_frame);
-        std::cerr << "MFCreateDXGISurfaceBuffer (NV12) failed: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-
-    nv12_sample->AddBuffer(nv12_buffer);
-    nv12_buffer->Release();
-    nv12_sample->SetSampleTime(timestamp * 10);
-    nv12_sample->SetSampleDuration(frame_duration_);
-
-    MFT_OUTPUT_DATA_BUFFER cc_out = {};
-    cc_out.dwStreamID = 0;
-    cc_out.pSample = nv12_sample;
-    DWORD cc_status = 0;
-    hr = color_converter_->ProcessOutput(0, 1, &cc_out, &cc_status);
-    if (cc_out.pEvents) {
-        cc_out.pEvents->Release();
-    }
-    if (FAILED(hr)) {
-        nv12_sample->Release();
-        av_frame_free(&nv12_frame);
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            return true;
+        if (output_buffer.pSample) {
+            output_buffer.pSample->Release();
         }
-        std::cerr << "Color converter ProcessOutput failed: 0x" << std::hex << hr << std::endl;
+
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            return true;  // Normal, just needs more input
+        }
+
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            std::cerr << "MFT stream format changed - need to reconfigure" << std::endl;
+            // The output format changed, we'd need to handle this
+            return false;
+        }
+
+        std::cerr << "ProcessOutput failed: 0x" << std::hex << hr << std::endl;
         return false;
     }
 
+    if (!output_buffer.pSample) {
+        std::cerr << "ProcessOutput succeeded but no sample returned" << std::endl;
+        return false;
+    }
+
+    IMFSample* nv12_sample = output_buffer.pSample;
+
+    // === STEP 5: Extract NV12 Data and Copy to NVENC Texture ===
+
+    // Get the buffer from MF's output sample
+    IMFMediaBuffer* nv12_buffer = nullptr;
+    hr = nv12_sample->GetBufferByIndex(0, &nv12_buffer);
+    if (FAILED(hr)) {
+        nv12_sample->Release();
+        std::cerr << "GetBufferByIndex failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    // Try to get as DXGI buffer
+    IMFDXGIBuffer* dxgi_buffer = nullptr;
+    hr = nv12_buffer->QueryInterface(__uuidof(IMFDXGIBuffer), (void**)&dxgi_buffer);
+
+    ID3D11Texture2D* mf_output_texture = nullptr;
+    UINT subresource_index = 0;
+
+    if (SUCCEEDED(hr) && dxgi_buffer) {
+        // MF gave us a GPU texture - great!
+        hr = dxgi_buffer->GetResource(__uuidof(ID3D11Texture2D), (void**)&mf_output_texture);
+        if (SUCCEEDED(hr)) {
+            dxgi_buffer->GetSubresourceIndex(&subresource_index);
+        }
+        dxgi_buffer->Release();
+    }
+
+    nv12_buffer->Release();
+
+    if (!mf_output_texture) {
+        // MF gave us a CPU buffer - we need to handle this differently
+        nv12_sample->Release();
+        std::cerr << "MF returned CPU buffer, not GPU texture - need different handling" << std::endl;
+        return false;
+    }
+
+    // === STEP 6: Get NVENC Frame ===
+    AVFrame* nvenc_frame = ffmpeg_encoder_ ? ffmpeg_encoder_->AcquireFrame() : nullptr;
+    if (!nvenc_frame) {
+        mf_output_texture->Release();
+        nv12_sample->Release();
+        std::cerr << "Failed to acquire NVENC frame" << std::endl;
+        return false;
+    }
+
+    ID3D11Texture2D* nvenc_texture = nullptr;
+    UINT nvenc_subresource = 0;
+    if (!ffmpeg_encoder_->GetFrameTexture(nvenc_frame, &nvenc_texture, &nvenc_subresource)) {
+        av_frame_free(&nvenc_frame);
+        mf_output_texture->Release();
+        nv12_sample->Release();
+        std::cerr << "Failed to get NVENC texture" << std::endl;
+        return false;
+    }
+
+    // === STEP 7: Copy MF Output to NVENC Input ===
+    if (subresource_index == 0 && nvenc_subresource == 0) {
+        d3d_context_->CopyResource(nvenc_texture, mf_output_texture);
+    }
+    else {
+        d3d_context_->CopySubresourceRegion(
+            nvenc_texture, nvenc_subresource,
+            0, 0, 0,
+            mf_output_texture, subresource_index,
+            nullptr
+        );
+    }
+
+    mf_output_texture->Release();
     nv12_sample->Release();
-    d3d_context_->CopySubresourceRegion(nv12_texture, nv12_subresource, 0, 0, 0, nv12_converter_texture_, 0, nullptr);
 
+    // === STEP 8: Encode ===
     std::vector<EncodedFrame> out_frames;
-    if (!ffmpeg_encoder_ ||
-        !ffmpeg_encoder_->EncodeFrame(nv12_frame, timestamp, out_frames)) {
+    if (!ffmpeg_encoder_->EncodeFrame(nvenc_frame, timestamp, out_frames)) {
+        std::cerr << "NVENC encoding failed" << std::endl;
         return false;
     }
 
+    // === STEP 9: Queue ===
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         for (auto& frame : out_frames) {
