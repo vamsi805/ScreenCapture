@@ -686,7 +686,7 @@ bool ScreenCaptureEncoder::InitializeNamedPipe() {
     // Format: \\.\pipe\PipeName
     pipe_handle_ = CreateNamedPipeW(
         pipe_name_.c_str(),                  // Pipe name
-        PIPE_ACCESS_OUTBOUND,                // Write-only access
+        PIPE_ACCESS_DUPLEX,                // Write-only access
         PIPE_TYPE_BYTE | PIPE_WAIT,          // Byte-type, blocking mode
         1,                                    // Max instances
         65536,                                // Output buffer size (64KB)
