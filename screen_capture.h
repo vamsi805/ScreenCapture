@@ -94,6 +94,9 @@ private:
     
     // Send encoded frame through named pipe
     bool SendFrameToPipe(const EncodedFrame& frame);
+
+    bool CreateMFTexturePool();
+
     
     // D3D11 objects
     ID3D11Device* d3d_device_;                          // Direct3D 11 device object
@@ -101,6 +104,9 @@ private:
     IDXGIOutputDuplication* desktop_duplication_;       // Desktop duplication interface
     IMFDXGIDeviceManager* dxgi_manager_;               // D3D11 device manager for MF MFTs
     UINT reset_token_;                                  // Token for DXGI device manager
+
+    std::vector<ID3D11Texture2D*> nv12_mf_pool_;  // For Media Foundation
+    size_t current_nv12_index_;
     
     // Media Foundation objects for video encoding
     IMFTransform* color_converter_;                     // RGB32 -> NV12 converter
