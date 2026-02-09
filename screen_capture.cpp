@@ -413,6 +413,7 @@ ScreenCaptureEncoder::ScreenCaptureEncoder()
     , reset_token_(0)
     , color_converter_(nullptr)
     , ffmpeg_encoder_(nullptr)
+    , nv12_converter_texture_(nullptr)
     , pipe_handle_(INVALID_HANDLE_VALUE)  // Invalid handle value from Windows
     , width_(1920)                         // Default 1080p width
     , height_(1080)                        // Default 1080p height
@@ -649,6 +650,22 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     }
     std::cout << "[Encoder] Video processor output type set" << std::endl;
 
+    D3D11_TEXTURE2D_DESC nv12_desc = {};
+    nv12_desc.Width = width_;
+    nv12_desc.Height = height_;
+    nv12_desc.MipLevels = 1;
+    nv12_desc.ArraySize = 1;
+    nv12_desc.Format = DXGI_FORMAT_NV12;
+    nv12_desc.SampleDesc.Count = 1;
+    nv12_desc.Usage = D3D11_USAGE_DEFAULT;
+    nv12_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    hr = d3d_device_->CreateTexture2D(&nv12_desc, nullptr, &nv12_converter_texture_);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create NV12 converter texture: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
     color_converter_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     color_converter_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
@@ -749,6 +766,11 @@ void ScreenCaptureEncoder::Stop() {
         color_converter_->Release();
         color_converter_ = nullptr;
     }
+
+    if (nv12_converter_texture_) {
+        nv12_converter_texture_->Release();
+        nv12_converter_texture_ = nullptr;
+    }
     
     
     if (desktop_duplication_) {
@@ -802,6 +824,7 @@ void ScreenCaptureEncoder::CaptureLoop() {
         if (CaptureFrame(&acquired_texture, &frame_info)) {
             // Encode the frame
             EncodeVideoFrame(acquired_texture, timestamp);
+            acquired_texture->Release();
             
             // Release the frame back to desktop duplication
             desktop_duplication_->ReleaseFrame();
@@ -887,6 +910,10 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
     if (!texture) {
         return false;
     }
+    if (!nv12_converter_texture_) {
+        std::cerr << "NV12 converter texture not initialized" << std::endl;
+        return false;
+    }
 
     // Wrap the GPU texture directly in an MF sample (no CPU readback).
     IMFSample* rgb_sample = nullptr;
@@ -923,7 +950,7 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
 
-    // Option A: use FFmpeg's NV12 surfaces as the video processor output target.
+    // Option A: use a dedicated NV12 surface for the video processor output.
     AVFrame* nv12_frame = ffmpeg_encoder_ ? ffmpeg_encoder_->AcquireFrame() : nullptr;
     if (!nv12_frame) {
         return false;
@@ -937,25 +964,27 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
     }
 
     IMFSample* nv12_sample = nullptr;
-    hr = MFCreateSample(&nv12_sample);
-    if (FAILED(hr)) {
-        av_frame_free(&nv12_frame);
-        return false;
-    }
+    if ((cc_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
+        hr = MFCreateSample(&nv12_sample);
+        if (FAILED(hr)) {
+            av_frame_free(&nv12_frame);
+            return false;
+        }
 
-    IMFMediaBuffer* nv12_buffer = nullptr;
-    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_texture, nv12_subresource, FALSE, &nv12_buffer);
-    if (FAILED(hr)) {
-        nv12_sample->Release();
-        av_frame_free(&nv12_frame);
-        std::cerr << "MFCreateDXGISurfaceBuffer (NV12) failed: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
+        IMFMediaBuffer* nv12_buffer = nullptr;
+        hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), nv12_converter_texture_, 0, FALSE, &nv12_buffer);
+        if (FAILED(hr)) {
+            nv12_sample->Release();
+            av_frame_free(&nv12_frame);
+            std::cerr << "MFCreateDXGISurfaceBuffer (NV12) failed: 0x" << std::hex << hr << std::endl;
+            return false;
+        }
 
-    nv12_sample->AddBuffer(nv12_buffer);
-    nv12_buffer->Release();
-    nv12_sample->SetSampleTime(timestamp * 10);
-    nv12_sample->SetSampleDuration(frame_duration_);
+        nv12_sample->AddBuffer(nv12_buffer);
+        nv12_buffer->Release();
+        nv12_sample->SetSampleTime(timestamp * 10);
+        nv12_sample->SetSampleDuration(frame_duration_);
+    }
 
     MFT_OUTPUT_DATA_BUFFER cc_out = {};
     cc_out.dwStreamID = 0;
@@ -966,7 +995,9 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         cc_out.pEvents->Release();
     }
     if (FAILED(hr)) {
-        nv12_sample->Release();
+        if (nv12_sample) {
+            nv12_sample->Release();
+        }
         av_frame_free(&nv12_frame);
         if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
             return true;
@@ -975,7 +1006,45 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
 
-    nv12_sample->Release();
+    IMFSample* output_sample = cc_out.pSample ? cc_out.pSample : nv12_sample;
+    if (!output_sample) {
+        av_frame_free(&nv12_frame);
+        return false;
+    }
+
+    IMFMediaBuffer* output_buffer = nullptr;
+    hr = output_sample->GetBufferByIndex(0, &output_buffer);
+    if (FAILED(hr)) {
+        output_sample->Release();
+        av_frame_free(&nv12_frame);
+        return false;
+    }
+
+    IMFDXGIBuffer* dxgi_buffer = nullptr;
+    hr = output_buffer->QueryInterface(IID_PPV_ARGS(&dxgi_buffer));
+    output_buffer->Release();
+    if (FAILED(hr)) {
+        output_sample->Release();
+        av_frame_free(&nv12_frame);
+        return false;
+    }
+
+    ID3D11Texture2D* converter_texture = nullptr;
+    hr = dxgi_buffer->GetResource(IID_PPV_ARGS(&converter_texture));
+    if (FAILED(hr)) {
+        dxgi_buffer->Release();
+        output_sample->Release();
+        av_frame_free(&nv12_frame);
+        return false;
+    }
+    UINT converter_subresource = 0;
+    dxgi_buffer->GetSubresourceIndex(&converter_subresource);
+    dxgi_buffer->Release();
+
+    d3d_context_->CopySubresourceRegion(nv12_texture, nv12_subresource, 0, 0, 0,
+                                        converter_texture, converter_subresource, nullptr);
+    converter_texture->Release();
+    output_sample->Release();
 
     std::vector<EncodedFrame> out_frames;
     if (!ffmpeg_encoder_ ||
