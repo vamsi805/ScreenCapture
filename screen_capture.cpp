@@ -668,7 +668,7 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     hr = MFCreateMediaType(&rgb_type);
     if (FAILED(hr)) return false;
     rgb_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    rgb_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+    rgb_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32);
     rgb_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
     MFSetAttributeSize(rgb_type, MF_MT_FRAME_SIZE, width_, height_);
     MFSetAttributeRatio(rgb_type, MF_MT_FRAME_RATE, fps_, 1);
@@ -953,21 +953,11 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
 
     // === STEP 1: Create RGB Input Sample ===
     IMFSample* rgb_sample = nullptr;
-    HRESULT hr = MFCreateSample(&rgb_sample);
+    HRESULT hr = MFCreateVideoSampleFromSurface(texture, &rgb_sample);
     if (FAILED(hr)) {
+        std::cerr << "MFCreateVideoSampleFromSurface (RGB) failed: 0x" << std::hex << hr << std::endl;
         return false;
     }
-
-    IMFMediaBuffer* rgb_buffer = nullptr;
-    hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture, 0, FALSE, &rgb_buffer);
-    if (FAILED(hr)) {
-        rgb_sample->Release();
-        std::cerr << "MFCreateDXGISurfaceBuffer (RGB) failed: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-
-    rgb_sample->AddBuffer(rgb_buffer);
-    rgb_buffer->Release();
     rgb_sample->SetSampleTime(timestamp * 10);
     rgb_sample->SetSampleDuration(frame_duration_);
 
@@ -1009,24 +999,12 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
     cc_out.dwStreamID = 0;
 
     if ((stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
-        hr = MFCreateSample(&nv12_sample);
+        hr = MFCreateVideoSampleFromSurface(mf_nv12_texture, &nv12_sample);
         if (FAILED(hr)) {
             av_frame_free(&nvenc_frame);
+            std::cerr << "MFCreateVideoSampleFromSurface (NV12) failed: 0x" << std::hex << hr << std::endl;
             return false;
         }
-
-        IMFMediaBuffer* nv12_buffer = nullptr;
-        hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), mf_nv12_texture, 0,
-                                       FALSE, &nv12_buffer);
-        if (FAILED(hr)) {
-            nv12_sample->Release();
-            av_frame_free(&nvenc_frame);
-            std::cerr << "MFCreateDXGISurfaceBuffer (NV12) failed: 0x" << std::hex << hr << std::endl;
-            return false;
-        }
-
-        nv12_sample->AddBuffer(nv12_buffer);
-        nv12_buffer->Release();
         nv12_sample->SetSampleTime(timestamp * 10);
         nv12_sample->SetSampleDuration(frame_duration_);
         cc_out.pSample = nv12_sample;
