@@ -664,32 +664,18 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
                                      reinterpret_cast<ULONG_PTR>(dxgi_manager_));
     std::cout << "[Encoder] Video processor D3D manager set" << std::endl;
 
-    auto try_set_input_type = [&](const GUID& subtype) -> HRESULT {
-        IMFMediaType* rgb_type = nullptr;
-        HRESULT local_hr = MFCreateMediaType(&rgb_type);
-        if (FAILED(local_hr)) {
-            return local_hr;
-        }
+    IMFMediaType* rgb_type = nullptr;
+    hr = MFCreateMediaType(&rgb_type);
+    if (FAILED(hr)) return false;
+    rgb_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    rgb_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32);
+    rgb_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    MFSetAttributeSize(rgb_type, MF_MT_FRAME_SIZE, width_, height_);
+    MFSetAttributeRatio(rgb_type, MF_MT_FRAME_RATE, fps_, 1);
+    MFSetAttributeRatio(rgb_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
-        rgb_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        rgb_type->SetGUID(MF_MT_SUBTYPE, subtype);
-        rgb_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        rgb_type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
-        rgb_type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-        rgb_type->SetUINT32(MF_MT_SAMPLE_SIZE, width_ * height_ * 4);
-        MFSetAttributeSize(rgb_type, MF_MT_FRAME_SIZE, width_, height_);
-        MFSetAttributeRatio(rgb_type, MF_MT_FRAME_RATE, fps_, 1);
-        MFSetAttributeRatio(rgb_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-        local_hr = color_converter_->SetInputType(0, rgb_type, 0);
-        rgb_type->Release();
-        return local_hr;
-    };
-
-    hr = try_set_input_type(MFVideoFormat_RGB32);
-    if (FAILED(hr)) {
-        hr = try_set_input_type(MFVideoFormat_ARGB32);
-    }
+    hr = color_converter_->SetInputType(0, rgb_type, 0);
+    rgb_type->Release();
     if (FAILED(hr)) {
         std::cerr << "Failed to set color converter input type: 0x" << std::hex << hr << std::endl;
         return false;
@@ -702,9 +688,6 @@ bool ScreenCaptureEncoder::InitializeVideoEncoder() {
     nv12_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     nv12_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     nv12_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    nv12_type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE);
-    nv12_type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-    nv12_type->SetUINT32(MF_MT_SAMPLE_SIZE, width_ * height_ * 3 / 2);
     MFSetAttributeSize(nv12_type, MF_MT_FRAME_SIZE, width_, height_);
     MFSetAttributeRatio(nv12_type, MF_MT_FRAME_RATE, fps_, 1);
     MFSetAttributeRatio(nv12_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
