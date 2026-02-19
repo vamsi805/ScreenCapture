@@ -33,6 +33,7 @@ target_link_libraries(ScreenCaptureEncoder
     wmcodecdspuuid # H.264 encoder CLSIDs
     ole32          # COM
     shlwapi      
+    evr          
     strmiids       # Additional Media Foundation IDs
 )
 

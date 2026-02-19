@@ -1,4 +1,5 @@
-﻿#include "screen_capture.h"
+﻿#include <initguid.h>  
+#include "screen_capture.h"
 #include <wmcodecdsp.h> // CLSID_CMSH264EncoderMFT (fallback if needed)
 #include <errno.h>
 
@@ -172,10 +173,14 @@ public:
 
     bool GetFrameTexture(AVFrame* frame, ID3D11Texture2D** texture, UINT* subresource) {
         if (!frame || !texture || !subresource) return false;
-        auto* desc = reinterpret_cast<AVD3D11FrameDescriptor*>(frame->data[0]);
-        if (!desc || !desc->texture) return false;
-        *texture = desc->texture;
-        *subresource = desc->index;
+
+        // For D3D11VA frames:
+        // frame->data[0] = ID3D11Texture2D* (the texture itself, not a struct)
+        // frame->data[1] = subresource index cast to pointer (intptr_t)
+        *texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
+        *subresource = static_cast<UINT>(reinterpret_cast<intptr_t>(frame->data[1]));
+
+        if (!*texture) return false;
         return true;
     }
 
@@ -413,7 +418,10 @@ ScreenCaptureEncoder::ScreenCaptureEncoder()
     , desktop_duplication_(nullptr)
     , dxgi_manager_(nullptr)
     , reset_token_(0)
-    , color_converter_(nullptr)
+    , video_device_(nullptr)       // ← ADD
+    , video_context_(nullptr)      // ← ADD
+    , vp_enumerator_(nullptr)      // ← ADD
+    , video_processor_(nullptr)
     , ffmpeg_encoder_(nullptr)
     , pipe_handle_(INVALID_HANDLE_VALUE)  // Invalid handle value from Windows
     , width_(1920)                         // Default 1080p width
@@ -634,77 +642,79 @@ bool ScreenCaptureEncoder::InitializeDuplication() {
     return true;
 }
 
-// Initialize H.264 video encoder using Media Foundation
+// Initialize H.264 video encoder using Media Foundatio
 bool ScreenCaptureEncoder::InitializeVideoEncoder() {
-    HRESULT hr;
-
     std::cout << "[Encoder] Initializing GPU pipeline..." << std::endl;
 
+    // --- Texture pools ---
     if (!CreateMFTexturePool()) {
-        std::cerr << "Failed to create MF texture pool" << std::endl;
+        std::cerr << "Failed to create NV12 texture pool" << std::endl;
         return false;
     }
 
+    // RGB staging texture (desktop duplication output -> VP input)
+    D3D11_TEXTURE2D_DESC rgb_desc = {};
+    rgb_desc.Width = width_;
+    rgb_desc.Height = height_;
+    rgb_desc.MipLevels = 1;
+    rgb_desc.ArraySize = 1;
+    rgb_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    rgb_desc.SampleDesc.Count = 1;
+    rgb_desc.Usage = D3D11_USAGE_DEFAULT;
+    rgb_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    rgb_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_GDI_COMPATIBLE;
 
-    // Create GPU video processor (RGB32 -> NV12)
-    hr = CoCreateInstance(CLSID_VideoProcessorMFT, nullptr, CLSCTX_INPROC_SERVER,
-                          IID_PPV_ARGS(&color_converter_));
+    HRESULT hr = d3d_device_->CreateTexture2D(&rgb_desc, nullptr, &rgb_staging_texture_);
     if (FAILED(hr)) {
-        std::cerr << "Failed to create video processor MFT: 0x" << std::hex << hr << std::endl;
+        std::cerr << "Failed to create RGB staging texture: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    std::cout << "[Encoder] Video processor MFT created" << std::endl;
+    std::cout << "[Encoder] RGB staging texture created" << std::endl;
 
-    IMFAttributes* cc_attrs = nullptr;
-    if (SUCCEEDED(color_converter_->GetAttributes(&cc_attrs)) && cc_attrs) {
-        cc_attrs->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
-        cc_attrs->Release();
-    }
-    color_converter_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
-                                     reinterpret_cast<ULONG_PTR>(dxgi_manager_));
-    std::cout << "[Encoder] Video processor D3D manager set" << std::endl;
-
-    IMFMediaType* rgb_type = nullptr;
-    hr = MFCreateMediaType(&rgb_type);
-    if (FAILED(hr)) return false;
-    rgb_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    rgb_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32);
-    rgb_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeSize(rgb_type, MF_MT_FRAME_SIZE, width_, height_);
-    MFSetAttributeRatio(rgb_type, MF_MT_FRAME_RATE, fps_, 1);
-    MFSetAttributeRatio(rgb_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-    hr = color_converter_->SetInputType(0, rgb_type, 0);
-    rgb_type->Release();
+    // --- D3D11 Video Device / Context ---
+    hr = d3d_device_->QueryInterface(IID_PPV_ARGS(&video_device_));
     if (FAILED(hr)) {
-        std::cerr << "Failed to set color converter input type: 0x" << std::hex << hr << std::endl;
+        std::cerr << "Failed to get ID3D11VideoDevice: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    std::cout << "[Encoder] Video processor input type set" << std::endl;
 
-    IMFMediaType* nv12_type = nullptr;
-    hr = MFCreateMediaType(&nv12_type);
-    if (FAILED(hr)) return false;
-    nv12_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    nv12_type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    nv12_type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    MFSetAttributeSize(nv12_type, MF_MT_FRAME_SIZE, width_, height_);
-    MFSetAttributeRatio(nv12_type, MF_MT_FRAME_RATE, fps_, 1);
-    MFSetAttributeRatio(nv12_type, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-    hr = color_converter_->SetOutputType(0, nv12_type, 0);
-    nv12_type->Release();
+    hr = d3d_context_->QueryInterface(IID_PPV_ARGS(&video_context_));
     if (FAILED(hr)) {
-        std::cerr << "Failed to set color converter output type: 0x" << std::hex << hr << std::endl;
+        std::cerr << "Failed to get ID3D11VideoContext: 0x" << std::hex << hr << std::endl;
         return false;
     }
-    std::cout << "[Encoder] Video processor output type set" << std::endl;
+    std::cout << "[Encoder] D3D11 video device/context acquired" << std::endl;
 
-    color_converter_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    color_converter_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    // --- Video Processor Enumerator ---
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC vp_desc = {};
+    vp_desc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    vp_desc.InputFrameRate.Numerator = fps_;
+    vp_desc.InputFrameRate.Denominator = 1;
+    vp_desc.InputWidth = width_;
+    vp_desc.InputHeight = height_;
+    vp_desc.OutputFrameRate.Numerator = fps_;
+    vp_desc.OutputFrameRate.Denominator = 1;
+    vp_desc.OutputWidth = width_;
+    vp_desc.OutputHeight = height_;
+    vp_desc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
 
+    hr = video_device_->CreateVideoProcessorEnumerator(&vp_desc, &vp_enumerator_);
+    if (FAILED(hr)) {
+        std::cerr << "CreateVideoProcessorEnumerator failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+
+    hr = video_device_->CreateVideoProcessor(vp_enumerator_, 0, &video_processor_);
+    if (FAILED(hr)) {
+        std::cerr << "CreateVideoProcessor failed: 0x" << std::hex << hr << std::endl;
+        return false;
+    }
+    std::cout << "[Encoder] D3D11 video processor created" << std::endl;
+
+    // --- FFmpeg NVENC ---
     ffmpeg_encoder_ = std::make_unique<FfmpegNvencEncoder>();
-    if (!ffmpeg_encoder_->Initialize(d3d_device_, d3d_context_, width_, height_, fps_, 5000000)) {
+    if (!ffmpeg_encoder_->Initialize(d3d_device_, d3d_context_,
+        width_, height_, fps_, 5000000)) {
         std::cerr << "Failed to initialize FFmpeg NVENC encoder" << std::endl;
         return false;
     }
@@ -795,11 +805,12 @@ void ScreenCaptureEncoder::Stop() {
         ffmpeg_encoder_.reset();
     }
 
-    if (color_converter_) {
-        color_converter_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        color_converter_->Release();
-        color_converter_ = nullptr;
-    }
+    if (video_processor_) { video_processor_->Release(); video_processor_ = nullptr; }
+    if (vp_enumerator_) { vp_enumerator_->Release();   vp_enumerator_ = nullptr; }
+    if (video_context_) { video_context_->Release();   video_context_ = nullptr; }
+    if (video_device_) { video_device_->Release();    video_device_ = nullptr; }
+    if (rgb_staging_texture_) { rgb_staging_texture_->Release(); rgb_staging_texture_ = nullptr; }
+
 
     for (auto* texture : nv12_mf_pool_) {
         if (texture) {
@@ -823,6 +834,11 @@ void ScreenCaptureEncoder::Stop() {
     if (d3d_device_) {
         d3d_device_->Release();
         d3d_device_ = nullptr;
+    }
+
+    if (rgb_staging_texture_) {
+        rgb_staging_texture_->Release();
+        rgb_staging_texture_ = nullptr;
     }
 
     if (dxgi_manager_) {
@@ -940,52 +956,72 @@ bool ScreenCaptureEncoder::CaptureFrame(ID3D11Texture2D** out_texture, DXGI_OUTD
     
     return true;
 }
+void ScreenCaptureEncoder::DrawCursorOntoTexture(ID3D11Texture2D* texture) {
+    // Get current cursor state
+    CURSORINFO ci = {};
+    ci.cbSize = sizeof(CURSORINFO);
+    if (!GetCursorInfo(&ci)) return;
+    if (!(ci.flags & CURSOR_SHOWING)) return; // cursor hidden, skip
+
+    // Get hotspot so the cursor tip aligns to the actual pointer position
+    ICONINFO ii = {};
+    if (!GetIconInfo(ci.hCursor, &ii)) return;
+
+    int draw_x = ci.ptScreenPos.x - static_cast<int>(ii.xHotspot);
+    int draw_y = ci.ptScreenPos.y - static_cast<int>(ii.yHotspot);
+
+    // Clean up ICONINFO bitmaps (GetIconInfo allocates these, we must free them)
+    if (ii.hbmMask)  DeleteObject(ii.hbmMask);
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+
+    // Get a GDI-compatible DC from the D3D11 texture via IDXGISurface1
+    // This requires D3D11_RESOURCE_MISC_GDI_COMPATIBLE on the texture
+    IDXGISurface1* dxgi_surface = nullptr;
+    HRESULT hr = texture->QueryInterface(IID_PPV_ARGS(&dxgi_surface));
+    if (FAILED(hr)) {
+        std::cerr << "DrawCursor: QueryInterface IDXGISurface1 failed: 0x"
+            << std::hex << hr << std::endl;
+        return;
+    }
+
+    HDC hdc = nullptr;
+    hr = dxgi_surface->GetDC(FALSE, &hdc); // FALSE = don't discard contents
+    if (FAILED(hr)) {
+        std::cerr << "DrawCursor: GetDC failed: 0x" << std::hex << hr << std::endl;
+        dxgi_surface->Release();
+        return;
+    }
+
+    // Draw the cursor including animated cursors and color cursors
+    DrawIconEx(hdc, draw_x, draw_y, ci.hCursor,
+        0, 0,          // width/height 0 = use cursor's natural size
+        0,             // animation step (0 = current frame)
+        nullptr,       // no background brush
+        DI_NORMAL);    // draw both mask and color
+
+    // Release DC back to DXGI — must be called before D3D uses the texture again
+    dxgi_surface->ReleaseDC(nullptr);
+    dxgi_surface->Release();
+}
 
 // Encode captured texture to H.264
 bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t timestamp) {
-    if (!texture) {
-        return false;
-    }
+    if (!texture) return false;
     if (nv12_mf_pool_.empty()) {
-        std::cerr << "NV12 MF texture pool not initialized" << std::endl;
+        std::cerr << "NV12 texture pool not initialized" << std::endl;
         return false;
     }
 
-    // === STEP 1: Create RGB Input Sample ===
-    IMFSample* rgb_sample = nullptr;
-    HRESULT hr = MFCreateVideoSampleFromSurface(texture, &rgb_sample);
-    if (FAILED(hr)) {
-        std::cerr << "MFCreateVideoSampleFromSurface (RGB) failed: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-    rgb_sample->SetSampleTime(timestamp * 10);
-    rgb_sample->SetSampleDuration(frame_duration_);
+    // === STEP 1: Copy desktop frame into staging texture ===
+    d3d_context_->CopyResource(rgb_staging_texture_, texture);
 
-    // === STEP 2: Send to Color Converter ===
-    hr = color_converter_->ProcessInput(0, rgb_sample, 0);
-    rgb_sample->Release();  // Can release now
 
-    if (FAILED(hr)) {
-        std::cerr << "Color converter ProcessInput failed: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
+    // === STEP 1b: Draw hardware cursor onto the staging texture ===
+    DrawCursorOntoTexture(rgb_staging_texture_);
 
-    // === STEP 3: Check Output Requirements ===
-    MFT_OUTPUT_STREAM_INFO stream_info = {};
-    hr = color_converter_->GetOutputStreamInfo(0, &stream_info);
-    if (FAILED(hr)) {
-        std::cerr << "GetOutputStreamInfo failed: 0x" << std::hex << hr << std::endl;
-        return false;
-    }
-
-    ID3D11Texture2D* mf_nv12_texture = nv12_mf_pool_[current_nv12_index_];
-    current_nv12_index_ = (current_nv12_index_ + 1) % nv12_mf_pool_.size();
-
-    // Option A: use a dedicated NV12 surface for the video processor output.
+    // === STEP 2: Get NVENC output texture ===
     AVFrame* nvenc_frame = ffmpeg_encoder_ ? ffmpeg_encoder_->AcquireFrame() : nullptr;
-    if (!nvenc_frame) {
-        return false;
-    }
+    if (!nvenc_frame) return false;
 
     ID3D11Texture2D* nv12_texture = nullptr;
     UINT nv12_subresource = 0;
@@ -994,116 +1030,67 @@ bool ScreenCaptureEncoder::EncodeVideoFrame(ID3D11Texture2D* texture, uint64_t t
         return false;
     }
 
-    IMFSample* nv12_sample = nullptr;
-    MFT_OUTPUT_DATA_BUFFER cc_out = {};
-    cc_out.dwStreamID = 0;
+    // === STEP 3: Create D3D11 VP input view (BGRA source) ===
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivd = {};
+    ivd.FourCC = 0;
+    ivd.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    ivd.Texture2D.MipSlice = 0;
 
-    if ((stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0) {
-        hr = MFCreateVideoSampleFromSurface(mf_nv12_texture, &nv12_sample);
-        if (FAILED(hr)) {
-            av_frame_free(&nvenc_frame);
-            std::cerr << "MFCreateVideoSampleFromSurface (NV12) failed: 0x" << std::hex << hr << std::endl;
-            return false;
-        }
-        nv12_sample->SetSampleTime(timestamp * 10);
-        nv12_sample->SetSampleDuration(frame_duration_);
-        cc_out.pSample = nv12_sample;
-    }
-
-    DWORD output_status = 0;
-    hr = color_converter_->ProcessOutput(0, 1, &cc_out, &output_status);
+    ID3D11VideoProcessorInputView* input_view = nullptr;
+    HRESULT hr = video_device_->CreateVideoProcessorInputView(
+        rgb_staging_texture_, vp_enumerator_, &ivd, &input_view);
     if (FAILED(hr)) {
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            if (nv12_sample) {
-                nv12_sample->Release();
-            }
-            av_frame_free(&nvenc_frame);
-            return true;
-        }
-        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            std::cerr << "MFT stream format changed - need to reconfigure" << std::endl;
-            if (nv12_sample) {
-                nv12_sample->Release();
-            }
-            av_frame_free(&nvenc_frame);
-            return false;
-        }
-        std::cerr << "Color converter ProcessOutput failed: 0x" << std::hex << hr << std::endl;
-        if (cc_out.pSample) {
-            cc_out.pSample->Release();
-        }
-        if (nv12_sample && nv12_sample != cc_out.pSample) {
-            nv12_sample->Release();
-        }
+        std::cerr << "CreateVideoProcessorInputView failed: 0x" << std::hex << hr << std::endl;
         av_frame_free(&nvenc_frame);
         return false;
     }
 
-    IMFSample* output_sample = cc_out.pSample ? cc_out.pSample : nv12_sample;
-    if (!output_sample) {
+    // === STEP 4: Create D3D11 VP output view (NV12 dest) ===
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovd = {};
+    ovd.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2DARRAY;
+    ovd.Texture2DArray.MipSlice = 0;
+    ovd.Texture2DArray.FirstArraySlice = nv12_subresource;                  
+    ovd.Texture2DArray.ArraySize = 1;
+
+
+    ID3D11VideoProcessorOutputView* output_view = nullptr;
+    hr = video_device_->CreateVideoProcessorOutputView(
+        nv12_texture, vp_enumerator_, &ovd, &output_view);
+    if (FAILED(hr)) {
+        std::cerr << "CreateVideoProcessorOutputView failed: 0x" << std::hex << hr << std::endl;
+        input_view->Release();
         av_frame_free(&nvenc_frame);
         return false;
     }
 
-    if (output_sample != nv12_sample) {
-        IMFMediaBuffer* sample_buffer = nullptr;
-        hr = output_sample->GetBufferByIndex(0, &sample_buffer);
-        if (FAILED(hr)) {
-            output_sample->Release();
-            if (nv12_sample) {
-                nv12_sample->Release();
-            }
-            av_frame_free(&nvenc_frame);
-            return false;
-        }
+    // === STEP 5: Set stream format and run conversion ===
+    video_context_->VideoProcessorSetStreamFrameFormat(
+        video_processor_, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
 
-        IMFDXGIBuffer* dxgi_buffer = nullptr;
-        hr = sample_buffer->QueryInterface(IID_PPV_ARGS(&dxgi_buffer));
-        sample_buffer->Release();
-        if (FAILED(hr)) {
-            output_sample->Release();
-            if (nv12_sample) {
-                nv12_sample->Release();
-            }
-            av_frame_free(&nvenc_frame);
-            return false;
-        }
+    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+    stream.Enable = TRUE;
+    stream.pInputSurface = input_view;
 
-        ID3D11Texture2D* converter_texture = nullptr;
-        hr = dxgi_buffer->GetResource(IID_PPV_ARGS(&converter_texture));
-        if (FAILED(hr)) {
-            dxgi_buffer->Release();
-            output_sample->Release();
-            if (nv12_sample) {
-                nv12_sample->Release();
-            }
-            av_frame_free(&nvenc_frame);
-            return false;
-        }
-        UINT converter_subresource = 0;
-        dxgi_buffer->GetSubresourceIndex(&converter_subresource);
-        dxgi_buffer->Release();
+    hr = video_context_->VideoProcessorBlt(
+        video_processor_, output_view, 0, 1, &stream);
 
-        d3d_context_->CopySubresourceRegion(nv12_texture, nv12_subresource, 0, 0, 0,
-                                            converter_texture, converter_subresource, nullptr);
-        converter_texture->Release();
-    } else {
-        d3d_context_->CopySubresourceRegion(nv12_texture, nv12_subresource, 0, 0, 0,
-                                            mf_nv12_texture, 0, nullptr);
-    }
-    output_sample->Release();
-    if (nv12_sample && nv12_sample != output_sample) {
-        nv12_sample->Release();
+    input_view->Release();
+    output_view->Release();
+
+    if (FAILED(hr)) {
+        std::cerr << "VideoProcessorBlt failed: 0x" << std::hex << hr << std::endl;
+        av_frame_free(&nvenc_frame);
+        return false;
     }
 
-    // === STEP 8: Encode ===
+    // === STEP 6: Encode ===
     std::vector<EncodedFrame> out_frames;
     if (!ffmpeg_encoder_->EncodeFrame(nvenc_frame, timestamp, out_frames)) {
         std::cerr << "NVENC encoding failed" << std::endl;
         return false;
     }
 
-    // === STEP 9: Queue ===
+    // === STEP 7: Queue ===
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         for (auto& frame : out_frames) {

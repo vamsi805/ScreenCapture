@@ -1,17 +1,24 @@
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0602   // Windows 8
+#endif
+
 #ifndef SCREEN_CAPTURE_H
 #define SCREEN_CAPTURE_H
+
 
 // Windows headers - must be included in this order to avoid conflicts
 #include <windows.h>          // Core Windows API types and functions
 #include <d3d11.h>            // Direct3D 11 interface for GPU access
 #include <dxgi1_2.h>          // DirectX Graphics Infrastructure for desktop duplication
 #include <mfapi.h>            // Media Foundation API for video encoding
+#include <mfobjects.h> 
 #include <mfidl.h>            // Media Foundation interfaces
 #include <mfreadwrite.h>      // Media Foundation read/write interfaces
 #include <mftransform.h>      // Media Foundation transforms (IMFTransform)
 #include <mferror.h>          // Media Foundation error codese
 #include <mmdeviceapi.h>      // Multimedia device enumeration
 #include <shlwapi.h>          // Shell lightweight utility APIs (for QISearch helper)
+#include <evr.h> 
 
 
 // Standard library
@@ -38,7 +45,7 @@ class FfmpegNvencEncoder;
 #pragma comment(lib, "wmcodecdspuuid.lib") // H.264 encoder CLSIDs
 #pragma comment(lib, "ole32.lib")        // COM library for object creation
 #pragma comment(lib, "shlwapi.lib")      // Shell utilities (for QISearch)
-
+#pragma comment(lib, "evr.lib") 
 
 // Structure to hold a single encoded frame with timestamp
 struct EncodedFrame {
@@ -97,6 +104,8 @@ private:
 
     bool CreateMFTexturePool();
 
+    void DrawCursorOntoTexture(ID3D11Texture2D* texture);
+
     
     // D3D11 objects
     ID3D11Device* d3d_device_;                          // Direct3D 11 device object
@@ -104,12 +113,16 @@ private:
     IDXGIOutputDuplication* desktop_duplication_;       // Desktop duplication interface
     IMFDXGIDeviceManager* dxgi_manager_;               // D3D11 device manager for MF MFTs
     UINT reset_token_;                                  // Token for DXGI device manager
+    ID3D11Texture2D* rgb_staging_texture_;  // Intermediate copy with correct bind flags
 
     std::vector<ID3D11Texture2D*> nv12_mf_pool_;  // For Media Foundation
     size_t current_nv12_index_;
     
     // Media Foundation objects for video encoding
-    IMFTransform* color_converter_;                     // RGB32 -> NV12 converter
+    ID3D11VideoDevice* video_device_;
+    ID3D11VideoContext* video_context_;
+    ID3D11VideoProcessorEnumerator* vp_enumerator_;
+    ID3D11VideoProcessor* video_processor_;
     std::unique_ptr<FfmpegNvencEncoder> ffmpeg_encoder_; // NVENC encoder via FFmpeg
     
        
